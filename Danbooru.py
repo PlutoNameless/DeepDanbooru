@@ -1,27 +1,27 @@
-"""
-DeepDanbooru V3 - fixed and cleaned implementation.
-
-Main fixes compared with the uploaded version:
-- fixes duplicate num_classes argument in CLI model creation
-- fixes get_feature_importance() dimensionality bug
-- fixes FocalLoss pos_weight usage
-- replaces BatchNorm1d with LayerNorm so batch_size=1 works
-- adds robust config serialization/loading
-- adds pretrained fallback to non-pretrained weights when timm cannot download weights
-- fixes CLI boolean flags such as --no_pretrained and --no_cbam
-"""
-
 from __future__ import annotations
 
 import argparse
+import csv
+import json
 import logging
+import math
+import os
+import random
 import sys
+import time
+from pathlib import Path
 from dataclasses import asdict, dataclass, fields, replace
-from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple, Union
 
 import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
+from torch.utils.data import DataLoader, Dataset
+
+try:
+    from PIL import Image
+except Exception:  # pragma: no cover - environment dependent
+    Image = None
 
 # torchvision is optional and is only used for data transforms.
 try:
@@ -869,44 +869,993 @@ def load_model(filepath: str, num_classes: Optional[int] = None, device: Union[s
     return model
 
 
-# -------------------- CLI --------------------
-def _build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="DeepDanbooru V3 Model - Fixed Version")
-    parser.add_argument("--num_classes", type=int, default=1000, help="Number of classes")
-    parser.add_argument("--model_name", type=str, default=None, help="Backbone model name")
-    parser.add_argument("--feature_dim", type=int, default=None, help="Unified feature dimension")
+# -------------------- Dataset, metrics, training, inference --------------------
+IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff"}
+LABEL_SEPARATORS = [",", ";", "|", "\t"]
 
+
+def set_seed(seed: int = 42) -> None:
+    random.seed(seed)
+    os.environ["PYTHONHASHSEED"] = str(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+def ensure_dir(path: Union[str, Path]) -> Path:
+    path = Path(path)
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def get_device(device_arg: Optional[str] = None) -> torch.device:
+    return torch.device(device_arg or ("cuda" if torch.cuda.is_available() else "cpu"))
+
+
+def load_tags(tags_path: Union[str, Path]) -> List[str]:
+    """Load tag names from txt/json/csv.
+
+    txt: one tag per line
+    json: list[str] or {"tags": [...]} or {"tag_to_idx": {...}}
+    csv: first column named tag/name, or first column by default
+    """
+    path = Path(tags_path)
+    if not path.exists():
+        raise FileNotFoundError(f"Tags file not found: {path}")
+
+    if path.suffix.lower() == ".json":
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if isinstance(data, list):
+            tags = [str(item) for item in data]
+        elif isinstance(data, dict) and "tags" in data:
+            tags = [str(item) for item in data["tags"]]
+        elif isinstance(data, dict) and "tag_to_idx" in data:
+            mapping = {str(k): int(v) for k, v in data["tag_to_idx"].items()}
+            tags = [tag for tag, _ in sorted(mapping.items(), key=lambda kv: kv[1])]
+        else:
+            raise ValueError("Unsupported json tag file format")
+    elif path.suffix.lower() == ".csv":
+        with path.open("r", encoding="utf-8-sig", newline="") as f:
+            reader = csv.DictReader(f)
+            if reader.fieldnames:
+                tag_col = "tag" if "tag" in reader.fieldnames else "name" if "name" in reader.fieldnames else reader.fieldnames[0]
+                tags = [row[tag_col].strip() for row in reader if row.get(tag_col, "").strip()]
+            else:
+                raise ValueError("CSV tag file must have a header")
+    else:
+        tags = [line.strip() for line in path.read_text(encoding="utf-8").splitlines()]
+        tags = [tag for tag in tags if tag and not tag.startswith("#")]
+
+    if not tags:
+        raise ValueError(f"No tags found in {path}")
+    if len(tags) != len(set(tags)):
+        duplicates = sorted({tag for tag in tags if tags.count(tag) > 1})[:10]
+        raise ValueError(f"Duplicate tags found: {duplicates}")
+    return tags
+
+
+def save_tags(tags: Sequence[str], path: Union[str, Path]) -> None:
+    path = Path(path)
+    ensure_dir(path.parent)
+    path.write_text("\n".join(str(tag) for tag in tags) + "\n", encoding="utf-8")
+
+
+def _split_label_string(value: str) -> List[Union[str, int]]:
+    value = value.strip()
+    if not value:
+        return []
+    # Prefer explicit separators. If none exists, fall back to whitespace, which matches Danbooru-style tags.
+    parts: List[str]
+    for sep in LABEL_SEPARATORS:
+        if sep in value:
+            parts = [item.strip() for item in value.split(sep) if item.strip()]
+            break
+    else:
+        parts = [item.strip() for item in value.split() if item.strip()]
+    if parts and all(part.lstrip("+-").isdigit() for part in parts):
+        return [int(part) for part in parts]
+    return parts
+
+
+def parse_labels(value: Any) -> Union[List[str], List[int], Tensor]:
+    """Parse labels from common annotation formats.
+
+    Supported examples:
+    - "blue_eyes,long_hair" or "blue_eyes long_hair"
+    - ["blue_eyes", "long_hair"]
+    - [2, 5, 10] as class indices
+    - [0, 1, 0, 1] as a one-hot / multi-hot vector
+    - {"blue_eyes": 1, "long_hair": true}
+    """
+    if value is None:
+        return []
+    if isinstance(value, Tensor):
+        return value.float()
+    if isinstance(value, str):
+        value = value.strip()
+        if not value:
+            return []
+        if value.startswith("[") or value.startswith("{"):
+            try:
+                return parse_labels(json.loads(value))
+            except Exception:
+                pass
+        return _split_label_string(value)
+    if isinstance(value, dict):
+        labels: List[str] = []
+        for key, flag in value.items():
+            if isinstance(flag, (int, float, bool)) and bool(flag):
+                labels.append(str(key))
+        return labels
+    if isinstance(value, (list, tuple)):
+        if not value:
+            return []
+        if all(isinstance(item, (int, float, bool)) for item in value):
+            # Keep numeric vectors/indices as integers. The dataset will disambiguate by length.
+            return [int(item) for item in value]
+        return [str(item).strip() for item in value if str(item).strip()]
+    raise TypeError(f"Unsupported label value type: {type(value)!r}")
+
+
+def _find_image_key(row: Dict[str, Any]) -> str:
+    candidates = ["image", "filename", "file", "path", "image_path", "filepath"]
+    for key in candidates:
+        if key in row and str(row[key]).strip():
+            return key
+    raise KeyError(f"Could not find an image path column. Tried: {candidates}")
+
+
+def _find_label_key(row: Dict[str, Any]) -> Optional[str]:
+    candidates = ["labels", "tags", "tag", "classes", "class", "target", "targets"]
+    for key in candidates:
+        if key in row:
+            return key
+    return None
+
+
+def read_annotations(annotation_path: Union[str, Path]) -> List[Dict[str, Any]]:
+    """Read annotations from CSV, JSON, or JSONL.
+
+    CSV examples:
+        image,labels
+        0001.jpg,"blue_eyes,long_hair"
+
+    JSON examples:
+        [{"image": "0001.jpg", "labels": ["blue_eyes", "long_hair"]}]
+
+    JSONL examples:
+        {"image": "0001.jpg", "labels": ["blue_eyes", "long_hair"]}
+    """
+    path = Path(annotation_path)
+    if not path.exists():
+        raise FileNotFoundError(f"Annotation file not found: {path}")
+    suffix = path.suffix.lower()
+
+    if suffix == ".csv":
+        with path.open("r", encoding="utf-8-sig", newline="") as f:
+            rows = list(csv.DictReader(f))
+    elif suffix == ".json":
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if isinstance(data, dict) and "items" in data:
+            rows = data["items"]
+        elif isinstance(data, dict) and "annotations" in data:
+            rows = data["annotations"]
+        elif isinstance(data, list):
+            rows = data
+        else:
+            raise ValueError("JSON annotation file must be a list or contain items/annotations")
+    elif suffix in {".jsonl", ".ndjson"}:
+        rows = []
+        for line_no, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rows.append(json.loads(line))
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"Invalid JSONL at line {line_no}: {exc}") from exc
+    else:
+        raise ValueError(f"Unsupported annotation format: {suffix}. Use csv/json/jsonl.")
+
+    if not isinstance(rows, list) or not rows:
+        raise ValueError(f"No annotation rows found in {path}")
+    if not all(isinstance(row, dict) for row in rows):
+        raise ValueError("All annotation entries must be objects/dicts")
+    return rows
+
+
+def build_tags_from_annotations(annotation_path: Union[str, Path]) -> List[str]:
+    rows = read_annotations(annotation_path)
+    tag_set = set()
+    max_index = -1
+    found_numeric_vector = False
+    for row in rows:
+        label_key = _find_label_key(row)
+        if label_key is None:
+            continue
+        labels = parse_labels(row[label_key])
+        if isinstance(labels, Tensor):
+            found_numeric_vector = True
+            max_index = max(max_index, int(labels.numel()) - 1)
+        elif labels and all(isinstance(item, int) for item in labels):
+            numeric = [int(item) for item in labels]
+            # If it looks like a multi-hot vector, use its length; otherwise use max index.
+            if set(numeric).issubset({0, 1}) and len(numeric) > 2:
+                found_numeric_vector = True
+                max_index = max(max_index, len(numeric) - 1)
+            else:
+                max_index = max(max_index, max(numeric))
+        else:
+            tag_set.update(str(item) for item in labels)
+
+    if tag_set:
+        return sorted(tag_set)
+    if max_index >= 0 or found_numeric_vector:
+        return [f"class_{idx}" for idx in range(max_index + 1)]
+    raise ValueError("Could not build tags from annotations. Provide --tags_path explicitly.")
+
+
+class DanbooruTagDataset(Dataset):
+    """Multi-label image dataset for Danbooru-style tags."""
+
+    def __init__(
+        self,
+        annotation_path: Union[str, Path],
+        image_dir: Optional[Union[str, Path]] = None,
+        tags: Optional[Sequence[str]] = None,
+        tags_path: Optional[Union[str, Path]] = None,
+        input_size: int = 224,
+        is_train: bool = True,
+        strict_images: bool = True,
+    ):
+        if Image is None:
+            raise ImportError("Pillow is required for image loading. Install it with: pip install pillow")
+        if not TORCHVISION_AVAILABLE:
+            raise ImportError("torchvision is required for dataset transforms. Install it with: pip install torchvision")
+
+        self.annotation_path = Path(annotation_path)
+        self.image_dir = Path(image_dir) if image_dir is not None else self.annotation_path.parent
+        self.input_size = int(input_size)
+        self.is_train = bool(is_train)
+        self.strict_images = strict_images
+
+        if tags_path is not None:
+            self.tags = load_tags(tags_path)
+        elif tags is not None:
+            self.tags = [str(tag) for tag in tags]
+        else:
+            self.tags = build_tags_from_annotations(annotation_path)
+
+        self.tag_to_idx = {tag: idx for idx, tag in enumerate(self.tags)}
+        self.num_classes = len(self.tags)
+        self.transform = DataAugmentation.get_train_transforms(input_size) if is_train else DataAugmentation.get_val_transforms(input_size)
+        if self.transform is None:
+            raise RuntimeError("Could not build torchvision transforms")
+
+        raw_rows = read_annotations(annotation_path)
+        self.samples: List[Tuple[Path, Tensor]] = []
+        missing_images: List[str] = []
+        unknown_labels: set[str] = set()
+
+        for row in raw_rows:
+            image_key = _find_image_key(row)
+            label_key = _find_label_key(row)
+            image_path = self._resolve_image_path(str(row[image_key]))
+            if not image_path.exists():
+                missing_images.append(str(image_path))
+                continue
+            labels_raw = parse_labels(row[label_key]) if label_key is not None else []
+            target, unknown = self._labels_to_target(labels_raw)
+            unknown_labels.update(unknown)
+            self.samples.append((image_path, target))
+
+        if strict_images and missing_images:
+            preview = "\n".join(missing_images[:10])
+            raise FileNotFoundError(f"Missing {len(missing_images)} images. First examples:\n{preview}")
+        if not self.samples:
+            raise ValueError(f"No valid samples loaded from {annotation_path}")
+        if unknown_labels:
+            preview = sorted(unknown_labels)[:20]
+            logger.warning("Ignored %d labels not present in tag list. Examples: %s", len(unknown_labels), preview)
+
+    def _resolve_image_path(self, image_value: str) -> Path:
+        path = Path(image_value)
+        if path.is_absolute():
+            return path
+        direct = self.image_dir / path
+        if direct.exists():
+            return direct
+        # Also try relative to annotation file parent.
+        return self.annotation_path.parent / path
+
+    def _labels_to_target(self, labels_raw: Union[List[str], List[int], Tensor]) -> Tuple[Tensor, List[str]]:
+        target = torch.zeros(self.num_classes, dtype=torch.float32)
+        unknown: List[str] = []
+
+        if isinstance(labels_raw, Tensor):
+            labels_raw = labels_raw.flatten().tolist()
+
+        if labels_raw and all(isinstance(item, int) for item in labels_raw):
+            values = [int(item) for item in labels_raw]
+            if len(values) == self.num_classes and set(values).issubset({0, 1}):
+                return torch.tensor(values, dtype=torch.float32), []
+            for idx in values:
+                if 0 <= idx < self.num_classes:
+                    target[idx] = 1.0
+                else:
+                    unknown.append(str(idx))
+            return target, unknown
+
+        for label in labels_raw:
+            label = str(label).strip()
+            if not label:
+                continue
+            idx = self.tag_to_idx.get(label)
+            if idx is None:
+                unknown.append(label)
+            else:
+                target[idx] = 1.0
+        return target, unknown
+
+    def __len__(self) -> int:
+        return len(self.samples)
+
+    def __getitem__(self, index: int) -> Dict[str, Any]:
+        image_path, target = self.samples[index]
+        with Image.open(image_path) as img:
+            image = img.convert("RGB")
+        tensor = self.transform(image)
+        return {"image": tensor, "target": target.clone(), "path": str(image_path)}
+
+    def label_counts(self) -> Tensor:
+        counts = torch.zeros(self.num_classes, dtype=torch.float32)
+        for _, target in self.samples:
+            counts += target
+        return counts
+
+
+def collate_batch(batch: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
+    return {
+        "image": torch.stack([item["image"] for item in batch], dim=0),
+        "target": torch.stack([item["target"] for item in batch], dim=0),
+        "path": [item["path"] for item in batch],
+    }
+
+
+def create_dataloader(
+    dataset: Dataset,
+    batch_size: int,
+    shuffle: bool,
+    num_workers: int,
+    pin_memory: bool = True,
+) -> DataLoader:
+    return DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=shuffle,
+        num_workers=num_workers,
+        pin_memory=pin_memory and torch.cuda.is_available(),
+        collate_fn=collate_batch,
+        drop_last=False,
+    )
+
+
+def build_pos_weight(dataset: DanbooruTagDataset, clamp_max: float = 20.0) -> Tensor:
+    positive = dataset.label_counts()
+    total = float(len(dataset))
+    negative = torch.clamp(torch.tensor(total) - positive, min=0.0)
+    pos_weight = negative / torch.clamp(positive, min=1.0)
+    return pos_weight.clamp(min=1.0, max=clamp_max)
+
+
+def build_training_criterion(config: ModelConfig, pos_weight: Optional[Tensor] = None) -> nn.Module:
+    if config.use_focal_loss:
+        return FocalLoss(alpha=config.focal_alpha, gamma=config.focal_gamma, pos_weight=pos_weight)
+    if config.use_label_smoothing:
+        return LabelSmoothingBCE(smoothing=config.label_smoothing, pos_weight=pos_weight)
+    return nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+
+
+def compute_multilabel_metrics(logits: Tensor, targets: Tensor, threshold: float = 0.5) -> Dict[str, float]:
+    probabilities = torch.sigmoid(logits)
+    predictions = probabilities >= threshold
+    targets_bool = targets >= 0.5
+
+    tp = (predictions & targets_bool).sum().item()
+    fp = (predictions & ~targets_bool).sum().item()
+    fn = (~predictions & targets_bool).sum().item()
+    tn = (~predictions & ~targets_bool).sum().item()
+
+    micro_precision = tp / max(tp + fp, 1)
+    micro_recall = tp / max(tp + fn, 1)
+    micro_f1 = 2 * micro_precision * micro_recall / max(micro_precision + micro_recall, 1e-12)
+    accuracy = (tp + tn) / max(tp + fp + fn + tn, 1)
+    exact_match = (predictions == targets_bool).all(dim=1).float().mean().item()
+
+    tp_c = (predictions & targets_bool).sum(dim=0).float()
+    fp_c = (predictions & ~targets_bool).sum(dim=0).float()
+    fn_c = (~predictions & targets_bool).sum(dim=0).float()
+    precision_c = tp_c / torch.clamp(tp_c + fp_c, min=1.0)
+    recall_c = tp_c / torch.clamp(tp_c + fn_c, min=1.0)
+    f1_c = 2 * precision_c * recall_c / torch.clamp(precision_c + recall_c, min=1e-12)
+
+    return {
+        "micro_precision": float(micro_precision),
+        "micro_recall": float(micro_recall),
+        "micro_f1": float(micro_f1),
+        "macro_precision": float(precision_c.mean().item()),
+        "macro_recall": float(recall_c.mean().item()),
+        "macro_f1": float(f1_c.mean().item()),
+        "accuracy": float(accuracy),
+        "exact_match": float(exact_match),
+    }
+
+
+def compute_mean_average_precision(logits: Tensor, targets: Tensor) -> float:
+    """Compute macro mAP on CPU. Suitable for validation, not for huge per-step usage."""
+    scores = torch.sigmoid(logits).detach().float().cpu()
+    labels = (targets.detach().float().cpu() >= 0.5).float()
+    aps: List[float] = []
+    for class_idx in range(labels.size(1)):
+        y_true = labels[:, class_idx]
+        positives = int(y_true.sum().item())
+        if positives == 0:
+            continue
+        y_score = scores[:, class_idx]
+        order = torch.argsort(y_score, descending=True)
+        sorted_true = y_true[order]
+        tp = torch.cumsum(sorted_true, dim=0)
+        ranks = torch.arange(1, sorted_true.numel() + 1, dtype=torch.float32)
+        precision_at_k = tp / ranks
+        ap = (precision_at_k * sorted_true).sum() / max(positives, 1)
+        aps.append(float(ap.item()))
+    return float(sum(aps) / len(aps)) if aps else 0.0
+
+
+def format_metrics(metrics: Dict[str, float]) -> str:
+    keys = ["loss", "micro_f1", "macro_f1", "micro_precision", "micro_recall", "mAP", "accuracy", "exact_match"]
+    parts = []
+    for key in keys:
+        if key in metrics:
+            parts.append(f"{key}={metrics[key]:.4f}")
+    return " | ".join(parts)
+
+
+def move_batch_to_device(batch: Dict[str, Any], device: torch.device) -> Tuple[Tensor, Tensor]:
+    images = batch["image"].to(device, non_blocking=True)
+    targets = batch["target"].to(device, non_blocking=True)
+    return images, targets
+
+
+def train_one_epoch(
+    model: DeepDanbooruV3,
+    loader: DataLoader,
+    optimizer: torch.optim.Optimizer,
+    device: torch.device,
+    epoch: int,
+    scaler: Optional[Any] = None,
+    amp: bool = False,
+    grad_clip: Optional[float] = None,
+    log_interval: int = 20,
+) -> Dict[str, float]:
+    model.train()
+    total_loss = 0.0
+    total_samples = 0
+    start_time = time.time()
+    use_amp = amp and device.type == "cuda"
+
+    for step, batch in enumerate(loader, start=1):
+        images, targets = move_batch_to_device(batch, device)
+        optimizer.zero_grad(set_to_none=True)
+
+        if use_amp:
+            with torch.autocast(device_type="cuda", dtype=torch.float16):
+                output = model(images, targets)
+                loss = output["loss"]
+            assert scaler is not None
+            scaler.scale(loss).backward()
+            if grad_clip is not None and grad_clip > 0:
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            output = model(images, targets)
+            loss = output["loss"]
+            loss.backward()
+            if grad_clip is not None and grad_clip > 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+            optimizer.step()
+
+        batch_size = images.size(0)
+        total_loss += float(loss.item()) * batch_size
+        total_samples += batch_size
+
+        if log_interval > 0 and step % log_interval == 0:
+            elapsed = max(time.time() - start_time, 1e-6)
+            logger.info(
+                "Epoch %d | step %d/%d | loss=%.4f | %.2f img/s",
+                epoch,
+                step,
+                len(loader),
+                total_loss / max(total_samples, 1),
+                total_samples / elapsed,
+            )
+
+    return {"loss": total_loss / max(total_samples, 1)}
+
+
+@torch.inference_mode()
+def validate(
+    model: DeepDanbooruV3,
+    loader: DataLoader,
+    device: torch.device,
+    threshold: float = 0.5,
+    compute_map: bool = False,
+) -> Dict[str, float]:
+    model.eval()
+    total_loss = 0.0
+    total_samples = 0
+    logits_list: List[Tensor] = []
+    targets_list: List[Tensor] = []
+
+    for batch in loader:
+        images, targets = move_batch_to_device(batch, device)
+        output = model(images, targets)
+        loss = output["loss"]
+        batch_size = images.size(0)
+        total_loss += float(loss.item()) * batch_size
+        total_samples += batch_size
+        logits_list.append(output["logits"].detach().cpu())
+        targets_list.append(targets.detach().cpu())
+
+    logits = torch.cat(logits_list, dim=0)
+    targets = torch.cat(targets_list, dim=0)
+    metrics = compute_multilabel_metrics(logits, targets, threshold=threshold)
+    metrics["loss"] = total_loss / max(total_samples, 1)
+    if compute_map:
+        metrics["mAP"] = compute_mean_average_precision(logits, targets)
+    return metrics
+
+
+def save_training_checkpoint(
+    filepath: Union[str, Path],
+    model: DeepDanbooruV3,
+    optimizer: Optional[torch.optim.Optimizer],
+    scheduler: Optional[Any],
+    scaler: Optional[Any],
+    epoch: int,
+    best_metric: float,
+    tags: Sequence[str],
+    input_size: int,
+    metrics: Optional[Dict[str, Any]] = None,
+) -> None:
+    filepath = Path(filepath)
+    ensure_dir(filepath.parent)
+    checkpoint: Dict[str, Any] = {
+        "model_state_dict": model.state_dict(),
+        "model_config": _config_to_dict(model.config),
+        "num_classes": model.num_classes,
+        "model_name": model.backbone.model_name,
+        "feature_channels": model.backbone.feature_channels,
+        "epoch": epoch,
+        "best_metric": best_metric,
+        "tags": list(tags),
+        "input_size": input_size,
+        "metrics": metrics or {},
+    }
+    if optimizer is not None:
+        checkpoint["optimizer_state_dict"] = optimizer.state_dict()
+    if scheduler is not None:
+        checkpoint["scheduler_state_dict"] = scheduler.state_dict()
+    if scaler is not None:
+        checkpoint["scaler_state_dict"] = scaler.state_dict()
+    torch.save(checkpoint, filepath)
+    logger.info("Checkpoint saved: %s", filepath)
+
+
+def load_checkpoint_metadata(checkpoint_path: Union[str, Path], device: Union[str, torch.device] = "cpu") -> Dict[str, Any]:
+    return _safe_torch_load(str(checkpoint_path), device)
+
+
+def load_model_from_checkpoint(
+    checkpoint_path: Union[str, Path],
+    device: Union[str, torch.device] = "cpu",
+    num_classes: Optional[int] = None,
+) -> DeepDanbooruV3:
+    checkpoint = load_checkpoint_metadata(checkpoint_path, device)
+    config = _coerce_config(checkpoint.get("model_config", ModelConfig()))
+    config = replace(config, pretrained=False)
+    if "model_name" in checkpoint:
+        config = replace(config, model_name=checkpoint["model_name"])
+    classes = int(num_classes or checkpoint.get("num_classes") or len(checkpoint.get("tags", [])) or 1000)
+    model = DeepDanbooruV3(classes, config).to(device)
+    model.load_state_dict(checkpoint["model_state_dict"])
+    return model
+
+
+def make_optimizer(model: nn.Module, lr: float, weight_decay: float) -> torch.optim.Optimizer:
+    decay: List[nn.Parameter] = []
+    no_decay: List[nn.Parameter] = []
+    for name, parameter in model.named_parameters():
+        if not parameter.requires_grad:
+            continue
+        if parameter.ndim <= 1 or name.endswith(".bias"):
+            no_decay.append(parameter)
+        else:
+            decay.append(parameter)
+    return torch.optim.AdamW(
+        [
+            {"params": decay, "weight_decay": weight_decay},
+            {"params": no_decay, "weight_decay": 0.0},
+        ],
+        lr=lr,
+    )
+
+
+def make_scheduler(optimizer: torch.optim.Optimizer, scheduler_type: str, epochs: int) -> Optional[Any]:
+    if scheduler_type == "none":
+        return None
+    if scheduler_type == "cosine":
+        return torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(epochs, 1))
+    if scheduler_type == "step":
+        return torch.optim.lr_scheduler.StepLR(optimizer, step_size=max(epochs // 3, 1), gamma=0.1)
+    raise ValueError("scheduler_type must be one of: none, cosine, step")
+
+
+def train_main(args: argparse.Namespace) -> int:
+    set_seed(args.seed)
+    output_dir = ensure_dir(args.output_dir)
+    device = get_device(args.device)
+    logger.info("Using device: %s", device)
+
+    tags = load_tags(args.tags_path) if args.tags_path else build_tags_from_annotations(args.train_annotations)
+    save_tags(tags, output_dir / "tags.txt")
+    logger.info("Number of tags/classes: %d", len(tags))
+
+    train_dataset = DanbooruTagDataset(
+        annotation_path=args.train_annotations,
+        image_dir=args.image_dir,
+        tags=tags,
+        input_size=args.input_size,
+        is_train=True,
+        strict_images=not args.allow_missing_images,
+    )
+    val_dataset = DanbooruTagDataset(
+        annotation_path=args.val_annotations,
+        image_dir=args.val_image_dir or args.image_dir,
+        tags=tags,
+        input_size=args.input_size,
+        is_train=False,
+        strict_images=not args.allow_missing_images,
+    ) if args.val_annotations else None
+
+    train_loader = create_dataloader(train_dataset, args.batch_size, shuffle=True, num_workers=args.num_workers)
+    val_loader = create_dataloader(val_dataset, args.batch_size, shuffle=False, num_workers=args.num_workers) if val_dataset else None
+
+    model_kwargs = model_kwargs_from_args(args)
+    model = create_model(num_classes=len(tags), **model_kwargs).to(device)
+
+    if args.freeze_backbone_epochs > 0:
+        set_backbone_trainable(model, False)
+        logger.info("Backbone frozen for first %d epoch(s)", args.freeze_backbone_epochs)
+
+    if args.use_pos_weight:
+        pos_weight = build_pos_weight(train_dataset, clamp_max=args.pos_weight_max).to(device)
+        model.criterion = build_training_criterion(model.config, pos_weight=pos_weight)
+        logger.info("Using positive class weights with max %.2f", args.pos_weight_max)
+
+    optimizer = make_optimizer(model, lr=args.lr, weight_decay=args.weight_decay)
+    scheduler = make_scheduler(optimizer, args.scheduler, args.epochs)
+    scaler = torch.cuda.amp.GradScaler(enabled=args.amp and device.type == "cuda") if hasattr(torch.cuda, "amp") else None
+    start_epoch = 1
+    best_metric = -math.inf
+
+    if args.resume:
+        checkpoint = load_checkpoint_metadata(args.resume, device)
+        model.load_state_dict(checkpoint["model_state_dict"])
+        if "optimizer_state_dict" in checkpoint:
+            optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        if scheduler is not None and "scheduler_state_dict" in checkpoint:
+            scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
+        if scaler is not None and "scaler_state_dict" in checkpoint:
+            scaler.load_state_dict(checkpoint["scaler_state_dict"])
+        start_epoch = int(checkpoint.get("epoch", 0)) + 1
+        best_metric = float(checkpoint.get("best_metric", best_metric))
+        logger.info("Resumed from %s at epoch %d", args.resume, start_epoch)
+
+    history: List[Dict[str, Any]] = []
+    for epoch in range(start_epoch, args.epochs + 1):
+        if args.freeze_backbone_epochs > 0 and epoch == args.freeze_backbone_epochs + 1:
+            set_backbone_trainable(model, True)
+            optimizer = make_optimizer(model, lr=args.lr, weight_decay=args.weight_decay)
+            scheduler = make_scheduler(optimizer, args.scheduler, args.epochs)
+            logger.info("Backbone unfrozen")
+
+        train_metrics = train_one_epoch(
+            model,
+            train_loader,
+            optimizer,
+            device,
+            epoch=epoch,
+            scaler=scaler,
+            amp=args.amp,
+            grad_clip=args.grad_clip,
+            log_interval=args.log_interval,
+        )
+        logger.info("Epoch %d train | %s", epoch, format_metrics(train_metrics))
+
+        val_metrics: Dict[str, float] = {}
+        if val_loader is not None:
+            val_metrics = validate(model, val_loader, device, threshold=args.threshold, compute_map=args.compute_map)
+            logger.info("Epoch %d valid | %s", epoch, format_metrics(val_metrics))
+
+        if scheduler is not None:
+            scheduler.step()
+
+        monitor_value = val_metrics.get(args.monitor, -val_metrics.get("loss", train_metrics["loss"])) if val_metrics else -train_metrics["loss"]
+        is_best = monitor_value > best_metric
+        if is_best:
+            best_metric = monitor_value
+
+        row = {"epoch": epoch, "train": train_metrics, "valid": val_metrics, "best_metric": best_metric}
+        history.append(row)
+        (output_dir / "history.json").write_text(json.dumps(history, ensure_ascii=False, indent=2), encoding="utf-8")
+
+        save_training_checkpoint(
+            output_dir / "last.pt",
+            model,
+            optimizer,
+            scheduler,
+            scaler,
+            epoch=epoch,
+            best_metric=best_metric,
+            tags=tags,
+            input_size=args.input_size,
+            metrics={"train": train_metrics, "valid": val_metrics},
+        )
+        if is_best:
+            save_training_checkpoint(
+                output_dir / "best.pt",
+                model,
+                optimizer,
+                scheduler,
+                scaler,
+                epoch=epoch,
+                best_metric=best_metric,
+                tags=tags,
+                input_size=args.input_size,
+                metrics={"train": train_metrics, "valid": val_metrics},
+            )
+        if args.save_every > 0 and epoch % args.save_every == 0:
+            save_training_checkpoint(
+                output_dir / f"epoch_{epoch:04d}.pt",
+                model,
+                optimizer,
+                scheduler,
+                scaler,
+                epoch=epoch,
+                best_metric=best_metric,
+                tags=tags,
+                input_size=args.input_size,
+                metrics={"train": train_metrics, "valid": val_metrics},
+            )
+
+    logger.info("Training completed. Best %s: %.4f", args.monitor, best_metric)
+    return 0
+
+
+def collect_image_paths(input_path: Union[str, Path], recursive: bool = True) -> List[Path]:
+    path = Path(input_path)
+    if not path.exists():
+        raise FileNotFoundError(f"Input path not found: {path}")
+    if path.is_file():
+        if path.suffix.lower() not in IMAGE_EXTENSIONS:
+            raise ValueError(f"Input file is not a supported image: {path}")
+        return [path]
+    pattern = "**/*" if recursive else "*"
+    images = [item for item in path.glob(pattern) if item.is_file() and item.suffix.lower() in IMAGE_EXTENSIONS]
+    images.sort()
+    if not images:
+        raise ValueError(f"No images found in {path}")
+    return images
+
+
+def load_image_tensor(image_path: Union[str, Path], input_size: int) -> Tensor:
+    if Image is None:
+        raise ImportError("Pillow is required for image loading. Install it with: pip install pillow")
+    if not TORCHVISION_AVAILABLE:
+        raise ImportError("torchvision is required for transforms. Install it with: pip install torchvision")
+    transform = DataAugmentation.get_val_transforms(input_size)
+    with Image.open(image_path) as img:
+        image = img.convert("RGB")
+    return transform(image)
+
+
+def decode_predictions(
+    probabilities: Tensor,
+    tags: Sequence[str],
+    threshold: float,
+    top_k: int,
+) -> List[Dict[str, Any]]:
+    results: List[Dict[str, Any]] = []
+    probabilities = probabilities.detach().cpu()
+    for row in probabilities:
+        k = min(top_k, row.numel())
+        top_probs, top_indices = torch.topk(row, k=k)
+        selected = [
+            {"tag": tags[idx], "probability": float(row[idx].item())}
+            for idx in torch.where(row >= threshold)[0].tolist()
+        ]
+        selected.sort(key=lambda item: item["probability"], reverse=True)
+        top = [
+            {"tag": tags[int(idx)], "probability": float(prob)}
+            for idx, prob in zip(top_indices.tolist(), top_probs.tolist())
+        ]
+        results.append({"selected": selected, "top_k": top})
+    return results
+
+
+@torch.inference_mode()
+def infer_images(
+    model: DeepDanbooruV3,
+    image_paths: Sequence[Path],
+    tags: Sequence[str],
+    device: torch.device,
+    input_size: int,
+    batch_size: int,
+    threshold: float,
+    top_k: int,
+) -> List[Dict[str, Any]]:
+    model.eval()
+    outputs: List[Dict[str, Any]] = []
+    for start in range(0, len(image_paths), batch_size):
+        batch_paths = image_paths[start:start + batch_size]
+        images = torch.stack([load_image_tensor(path, input_size) for path in batch_paths], dim=0).to(device)
+        probabilities = model(images)["probabilities"]
+        decoded = decode_predictions(probabilities, tags=tags, threshold=threshold, top_k=top_k)
+        for path, item in zip(batch_paths, decoded):
+            item = {"image": str(path), **item}
+            outputs.append(item)
+    return outputs
+
+
+def write_inference_results(results: Sequence[Dict[str, Any]], output_path: Union[str, Path]) -> None:
+    output_path = Path(output_path)
+    ensure_dir(output_path.parent)
+    if output_path.suffix.lower() == ".csv":
+        with output_path.open("w", encoding="utf-8-sig", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=["image", "selected_tags", "top_k"])
+            writer.writeheader()
+            for item in results:
+                writer.writerow(
+                    {
+                        "image": item["image"],
+                        "selected_tags": " ".join(tag_item["tag"] for tag_item in item["selected"]),
+                        "top_k": json.dumps(item["top_k"], ensure_ascii=False),
+                    }
+                )
+    else:
+        output_path.write_text(json.dumps(list(results), ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def infer_main(args: argparse.Namespace) -> int:
+    device = get_device(args.device)
+    checkpoint = load_checkpoint_metadata(args.checkpoint, device)
+    checkpoint_tags = checkpoint.get("tags")
+    tags = load_tags(args.tags_path) if args.tags_path else checkpoint_tags
+    if not tags:
+        raise ValueError("No tags found in checkpoint. Please pass --tags_path.")
+    tags = [str(tag) for tag in tags]
+
+    input_size = int(args.input_size or checkpoint.get("input_size", 224))
+    model = load_model_from_checkpoint(args.checkpoint, device=device, num_classes=len(tags))
+    image_paths = collect_image_paths(args.input, recursive=not args.no_recursive)
+    logger.info("Loaded %d image(s) for inference", len(image_paths))
+
+    results = infer_images(
+        model=model,
+        image_paths=image_paths,
+        tags=tags,
+        device=device,
+        input_size=input_size,
+        batch_size=args.batch_size,
+        threshold=args.threshold,
+        top_k=args.top_k,
+    )
+
+    if args.output:
+        write_inference_results(results, args.output)
+        logger.info("Inference results saved to %s", args.output)
+    else:
+        print(json.dumps(results, ensure_ascii=False, indent=2))
+    return 0
+
+
+def export_onnx_main(args: argparse.Namespace) -> int:
+    device = get_device(args.device)
+    checkpoint = load_checkpoint_metadata(args.checkpoint, device)
+    tags = checkpoint.get("tags")
+    num_classes = len(tags) if tags else int(checkpoint.get("num_classes", 1000))
+    input_size = int(args.input_size or checkpoint.get("input_size", 224))
+    model = load_model_from_checkpoint(args.checkpoint, device=device, num_classes=num_classes)
+    model.eval()
+
+    class OnnxWrapper(nn.Module):
+        def __init__(self, inner: DeepDanbooruV3):
+            super().__init__()
+            self.inner = inner
+
+        def forward(self, images: Tensor) -> Tensor:
+            return self.inner(images)["probabilities"]
+
+    wrapper = OnnxWrapper(model).to(device).eval()
+    dummy = torch.randn(1, 3, input_size, input_size, device=device)
+    output_path = Path(args.output)
+    ensure_dir(output_path.parent)
+    torch.onnx.export(
+        wrapper,
+        dummy,
+        str(output_path),
+        input_names=["images"],
+        output_names=["probabilities"],
+        opset_version=args.opset,
+        dynamic_axes={"images": {0: "batch"}, "probabilities": {0: "batch"}},
+    )
+    logger.info("ONNX exported to %s", output_path)
+    return 0
+
+
+def smoke_test_main(args: argparse.Namespace) -> int:
+    device = get_device(args.device)
+    model_kwargs = model_kwargs_from_args(args)
+    model = create_model(num_classes=args.num_classes, **model_kwargs).to(device)
+    stats = model_summary(model, input_size=(3, args.input_size, args.input_size))
+    logger.info("Model created successfully")
+    logger.info("Backbone: %s", model.backbone.model_name)
+    logger.info("Fusion: %s", model.config.fusion_type)
+    logger.info("Parameters: %s", f"{stats['total_params']:,}")
+
+    batch_size = 2
+    images = torch.randn(batch_size, 3, args.input_size, args.input_size, device=device)
+    targets = torch.randint(0, 2, (batch_size, args.num_classes), device=device).float()
+    model.eval()
+    with torch.inference_mode():
+        output = model(images, targets)
+        logger.info("Forward successful: logits=%s loss=%.4f", tuple(output["logits"].shape), float(output["loss"].item()))
+        top_indices, top_probs = model.predict_top_k(images, k=5)
+        logger.info("Top-k successful: %s %s", tuple(top_indices.shape), tuple(top_probs.shape))
+    model.train()
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
+    optimizer.zero_grad(set_to_none=True)
+    output = model(images, targets)
+    output["loss"].backward()
+    optimizer.step()
+    logger.info("Backward/training step successful")
+    return 0
+
+
+# -------------------- CLI --------------------
+def add_model_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--model_name", type=str, default=None, help="Backbone model name, e.g. efficientnet_b0")
+    parser.add_argument("--feature_dim", type=int, default=None, help="Unified feature dimension")
     parser.add_argument("--pretrained", dest="pretrained", action="store_true", default=None, help="Use pretrained weights")
     parser.add_argument("--no_pretrained", dest="pretrained", action="store_false", help="Do not use pretrained weights")
-
     loss_group = parser.add_mutually_exclusive_group()
-    loss_group.add_argument("--use_focal_loss", action="store_true", help="Use focal loss instead of BCE")
-    loss_group.add_argument("--use_label_smoothing", action="store_true", help="Use label smoothing BCE loss")
-    parser.add_argument("--focal_alpha", type=float, default=None, help="Focal loss alpha")
-    parser.add_argument("--focal_gamma", type=float, default=None, help="Focal loss gamma")
-    parser.add_argument("--label_smoothing", type=float, default=None, help="Label smoothing value")
-
-    parser.add_argument(
-        "--fusion_type",
-        type=str,
-        default=None,
-        choices=["attention", "weighted", "pyramid", "concat"],
-        help="Feature fusion method",
-    )
-    parser.add_argument("--use_cbam", dest="use_cbam", action="store_true", default=None, help="Use CBAM attention")
-    parser.add_argument("--no_cbam", dest="use_cbam", action="store_false", help="Disable CBAM attention")
-    parser.add_argument("--classifier_dropout", type=float, default=None, help="Classifier dropout rate")
-    parser.add_argument("--projection_dropout", type=float, default=None, help="Projection dropout rate")
-
-    parser.add_argument("--device", type=str, default=None, help="cpu, cuda, cuda:0, etc.")
-    parser.add_argument("--input_size", type=int, default=224, help="Test input image size")
-    parser.add_argument("--test", action="store_true", help="Run a forward/backward smoke test")
-    parser.add_argument("--compatibility_test", action="store_true", help="Run compatibility tests")
-    return parser
+    loss_group.add_argument("--use_focal_loss", action="store_true", help="Use focal loss")
+    loss_group.add_argument("--use_label_smoothing", action="store_true", help="Use label smoothing BCE")
+    parser.add_argument("--focal_alpha", type=float, default=None)
+    parser.add_argument("--focal_gamma", type=float, default=None)
+    parser.add_argument("--label_smoothing", type=float, default=None)
+    parser.add_argument("--fusion_type", type=str, default=None, choices=["attention", "weighted", "pyramid", "concat"])
+    parser.add_argument("--use_cbam", dest="use_cbam", action="store_true", default=None, help="Use CBAM")
+    parser.add_argument("--no_cbam", dest="use_cbam", action="store_false", help="Disable CBAM")
+    parser.add_argument("--classifier_dropout", type=float, default=None)
+    parser.add_argument("--projection_dropout", type=float, default=None)
 
 
-def _model_kwargs_from_args(args: argparse.Namespace) -> Dict[str, Any]:
-    valid_keys = {f.name for f in fields(ModelConfig)}
+def model_kwargs_from_args(args: argparse.Namespace) -> Dict[str, Any]:
+    valid_keys = {field.name for field in fields(ModelConfig)}
     data: Dict[str, Any] = {}
     for key in valid_keys:
         if hasattr(args, key):
@@ -916,68 +1865,92 @@ def _model_kwargs_from_args(args: argparse.Namespace) -> Dict[str, Any]:
     return data
 
 
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="DeepDanbooru V3 complete single-file training and inference project",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    subparsers = parser.add_subparsers(dest="command")
+
+    train_parser = subparsers.add_parser("train", help="Train a multi-label tag model")
+    add_model_arguments(train_parser)
+    train_parser.add_argument("--train_annotations", required=True, help="CSV/JSON/JSONL train annotations")
+    train_parser.add_argument("--val_annotations", default=None, help="CSV/JSON/JSONL validation annotations")
+    train_parser.add_argument("--image_dir", default=None, help="Root directory for training images")
+    train_parser.add_argument("--val_image_dir", default=None, help="Root directory for validation images")
+    train_parser.add_argument("--tags_path", default=None, help="Tag file. If omitted, tags are built from train annotations")
+    train_parser.add_argument("--output_dir", default="runs/deepdanbooru_v3", help="Output directory")
+    train_parser.add_argument("--epochs", type=int, default=10)
+    train_parser.add_argument("--batch_size", type=int, default=16)
+    train_parser.add_argument("--num_workers", type=int, default=4)
+    train_parser.add_argument("--input_size", type=int, default=224)
+    train_parser.add_argument("--lr", type=float, default=1e-4)
+    train_parser.add_argument("--weight_decay", type=float, default=1e-4)
+    train_parser.add_argument("--scheduler", type=str, default="cosine", choices=["none", "cosine", "step"])
+    train_parser.add_argument("--threshold", type=float, default=0.5)
+    train_parser.add_argument("--monitor", type=str, default="micro_f1", help="Validation metric for best.pt")
+    train_parser.add_argument("--compute_map", action="store_true", help="Compute validation mAP")
+    train_parser.add_argument("--use_pos_weight", action="store_true", help="Use BCE/Focal positive class weights")
+    train_parser.add_argument("--pos_weight_max", type=float, default=20.0)
+    train_parser.add_argument("--freeze_backbone_epochs", type=int, default=0)
+    train_parser.add_argument("--grad_clip", type=float, default=None)
+    train_parser.add_argument("--amp", action="store_true", help="Use CUDA mixed precision")
+    train_parser.add_argument("--resume", default=None, help="Resume checkpoint path")
+    train_parser.add_argument("--save_every", type=int, default=0, help="Save every N epochs; 0 disables periodic saves")
+    train_parser.add_argument("--log_interval", type=int, default=20)
+    train_parser.add_argument("--allow_missing_images", action="store_true")
+    train_parser.add_argument("--seed", type=int, default=42)
+    train_parser.add_argument("--device", default=None)
+    train_parser.set_defaults(func=train_main)
+
+    infer_parser = subparsers.add_parser("infer", help="Run inference on one image or a folder")
+    infer_parser.add_argument("--checkpoint", required=True, help="Path to best.pt/last.pt")
+    infer_parser.add_argument("--input", required=True, help="Image file or directory")
+    infer_parser.add_argument("--tags_path", default=None, help="Optional tag file if checkpoint does not contain tags")
+    infer_parser.add_argument("--output", default=None, help="Output .json or .csv. If omitted, prints JSON")
+    infer_parser.add_argument("--input_size", type=int, default=None, help="Override checkpoint input size")
+    infer_parser.add_argument("--batch_size", type=int, default=8)
+    infer_parser.add_argument("--threshold", type=float, default=0.5)
+    infer_parser.add_argument("--top_k", type=int, default=20)
+    infer_parser.add_argument("--no_recursive", action="store_true", help="Do not recursively scan image directories")
+    infer_parser.add_argument("--device", default=None)
+    infer_parser.set_defaults(func=infer_main)
+
+    export_parser = subparsers.add_parser("export_onnx", help="Export checkpoint to ONNX")
+    export_parser.add_argument("--checkpoint", required=True)
+    export_parser.add_argument("--output", required=True)
+    export_parser.add_argument("--input_size", type=int, default=None)
+    export_parser.add_argument("--opset", type=int, default=17)
+    export_parser.add_argument("--device", default=None)
+    export_parser.set_defaults(func=export_onnx_main)
+
+    test_parser = subparsers.add_parser("test", help="Run a smoke test")
+    add_model_arguments(test_parser)
+    test_parser.add_argument("--num_classes", type=int, default=1000)
+    test_parser.add_argument("--input_size", type=int, default=224)
+    test_parser.add_argument("--device", default=None)
+    test_parser.set_defaults(func=smoke_test_main)
+
+    compat_parser = subparsers.add_parser("compatibility_test", help="Test several model configs")
+    compat_parser.set_defaults(func=lambda args: (test_model_compatibility() or 0))
+
+    return parser
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
-    parser = _build_parser()
+    parser = build_parser()
     args = parser.parse_args(argv)
-
-    try:
-        if args.compatibility_test:
-            test_model_compatibility()
-            return 0
-
-        device = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
-        model_kwargs = _model_kwargs_from_args(args)
-        model = create_model(num_classes=args.num_classes, **model_kwargs).to(device)
-        stats = model_summary(model, input_size=(3, args.input_size, args.input_size))
-
-        logger.info("Model created successfully")
-        logger.info("Classes: %s", args.num_classes)
-        logger.info("Backbone: %s", model.backbone.model_name)
-        logger.info("Pretrained loaded: %s", model.backbone.loaded_pretrained)
-        logger.info("Fusion type: %s", model.config.fusion_type)
-        logger.info("Total parameters: %s", f"{stats['total_params']:,}")
-        logger.info("Trainable parameters: %s", f"{stats['trainable_params']:,}")
-        logger.info("Model size: %.2f MB", stats["total_size_mb"])
-
-        if args.test:
-            logger.info("Running smoke test...")
-            batch_size = 2
-            input_tensor = torch.randn(batch_size, 3, args.input_size, args.input_size, device=device)
-            target_tensor = torch.randint(0, 2, (batch_size, args.num_classes), device=device).float()
-
-            model.eval()
-            with torch.inference_mode():
-                output = model(input_tensor, target_tensor)
-                logger.info("✓ Forward pass successful")
-                for key, value in output.items():
-                    if isinstance(value, torch.Tensor):
-                        logger.info("  %s: %s", key, tuple(value.shape) if value.ndim > 0 else float(value.item()))
-
-                predictions = model.predict(input_tensor, threshold=0.5)
-                logger.info("✓ Predictions shape: %s", tuple(predictions.shape))
-
-                top_indices, top_probs = model.predict_top_k(input_tensor, k=5)
-                logger.info("✓ Top-5 predictions: %s, %s", tuple(top_indices.shape), tuple(top_probs.shape))
-
-                importance = model.get_feature_importance(input_tensor)
-                logger.info("✓ Feature importance scales: %s", {k: tuple(v.shape) for k, v in importance.items()})
-
-            model.train()
-            optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
-            optimizer.zero_grad(set_to_none=True)
-            output = model(input_tensor, target_tensor)
-            loss = output["loss"]
-            loss.backward()
-            optimizer.step()
-            logger.info("✓ Training step successful. Loss: %.4f", float(loss.item()))
-            logger.info("All tests passed")
-
+    if not hasattr(args, "func"):
+        parser.print_help()
         return 0
-
+    try:
+        return int(args.func(args))
+    except KeyboardInterrupt:
+        logger.error("Interrupted")
+        return 130
     except Exception as exc:
         logger.error("Error: %s", exc)
         import traceback
-
         traceback.print_exc()
         return 1
 

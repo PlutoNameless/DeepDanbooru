@@ -1,6 +1,7 @@
 import argparse
 import copy
 import csv
+import hashlib
 import json
 import logging
 import math
@@ -59,6 +60,59 @@ IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff"}
 LABEL_SEPARATORS = [",", ";", "|", "\t"]
 
 
+def normalize_tag_text(tag: str) -> str:
+    tag = str(tag).strip().lower()
+    tag = tag.replace("_", " ").replace("-", " ")
+    tag = re.sub(r"\s+", " ", tag)
+    tag = re.sub(r"[^a-z0-9\s:/().+]+", "", tag)
+    return tag.strip()
+
+
+def tag_to_prompt(tag: str, prefix: str = "anime image with") -> str:
+    text = normalize_tag_text(tag)
+    if not text:
+        return prefix
+    text = text.replace("1girl", "one girl").replace("1boy", "one boy")
+    return f"{prefix} {text}"
+
+
+def _stable_hash_int(text: str) -> int:
+    digest = hashlib.blake2b(text.encode("utf-8"), digest_size=8).digest()
+    return int.from_bytes(digest, byteorder="little", signed=False)
+
+
+def build_hash_text_embeddings(tags: Sequence[str], dim: int = 512, prompt_prefix: str = "anime image with") -> Tensor:
+    """Deterministic lexical fallback embeddings for tags.
+
+    Transformer text embeddings are preferred for semantic generalization, but this fallback keeps
+    the semantic head usable in offline environments and makes checkpoints self-contained enough to
+    run without Hugging Face dependencies.
+    """
+
+    dim = max(int(dim), 8)
+    vectors = torch.zeros((len(tags), dim), dtype=torch.float32)
+    for row, tag in enumerate(tags):
+        prompt = normalize_tag_text(tag_to_prompt(str(tag), prompt_prefix))
+        if not prompt:
+            prompt = f"class {row}"
+        tokens: List[Tuple[str, float]] = []
+        words = prompt.split()
+        tokens.extend((f"word:{word}", 1.5) for word in words)
+        tokens.extend((f"pair:{a}_{b}", 1.2) for a, b in zip(words, words[1:]))
+        compact = f" {prompt} "
+        for n in (2, 3, 4):
+            if len(compact) >= n:
+                tokens.extend((f"ngram:{compact[i:i + n]}", 1.0 / n) for i in range(len(compact) - n + 1))
+        if not tokens:
+            tokens.append((f"empty:{row}", 1.0))
+        for token, weight in tokens:
+            value = _stable_hash_int(token)
+            bucket = value % dim
+            sign = 1.0 if ((value >> 63) & 1) == 0 else -1.0
+            vectors[row, bucket] += sign * weight
+    return F.normalize(vectors, dim=-1)
+
+
 # -------------------- Configuration --------------------
 @dataclass
 class ModelConfig:
@@ -88,6 +142,19 @@ class ModelConfig:
     asl_gamma_neg: float = 4.0
     asl_clip: float = 0.05
     asl_eps: float = 1e-8
+
+    # Semantic alignment head.
+    # The closed classifier learns the training tags exactly; this head learns an image/text
+    # semantic space so inference can score tags that were not supervised classes.
+    use_semantic_head: bool = True
+    semantic_dim: int = 512
+    semantic_loss_weight: float = 0.15
+    semantic_negative_weight: float = 0.2
+    semantic_projection_dropout: float = 0.1
+    semantic_logit_scale: float = 10.0
+    semantic_embedding_backend: str = "auto"  # auto | transformers | hash
+    semantic_text_model: str = "google/siglip-base-patch16-384"
+    semantic_prompt_prefix: str = "anime image with"
 
 
 def _tuple_from_any(value: Any) -> Tuple[int, ...]:
@@ -613,6 +680,68 @@ def build_training_criterion(config: ModelConfig, pos_weight: Optional[Tensor] =
     raise ValueError("loss_type must be one of: asl, bce, focal, smooth_bce")
 
 
+class SemanticAlignmentHead(nn.Module):
+    """Projects image features into a tag-text embedding space."""
+
+    def __init__(
+        self,
+        feature_dim: int,
+        semantic_dim: int,
+        num_classes: int,
+        dropout: float = 0.1,
+        logit_scale: float = 10.0,
+    ):
+        super().__init__()
+        self.feature_dim = int(feature_dim)
+        self.semantic_dim = int(semantic_dim)
+        self.num_classes = int(num_classes)
+        hidden = max(self.feature_dim, self.semantic_dim)
+        self.projection = nn.Sequential(
+            nn.LayerNorm(self.feature_dim),
+            nn.Linear(self.feature_dim, hidden),
+            nn.SiLU(inplace=True),
+            nn.Dropout(dropout),
+            nn.Linear(hidden, self.semantic_dim),
+        )
+        self.logit_scale = nn.Parameter(torch.tensor(math.log(max(float(logit_scale), 1e-3)), dtype=torch.float32))
+        self.register_buffer("label_embeddings", torch.zeros(self.num_classes, self.semantic_dim, dtype=torch.float32))
+        self.register_buffer("label_embeddings_ready", torch.zeros((), dtype=torch.uint8))
+        self._label_embeddings_ready = False
+
+    def has_label_embeddings(self) -> bool:
+        return self._label_embeddings_ready
+
+    @torch.no_grad()
+    def set_label_embeddings(self, embeddings: Tensor) -> None:
+        embeddings = embeddings.detach().float().cpu()
+        if embeddings.ndim != 2:
+            raise ValueError(f"Semantic embeddings must be [num_tags, dim], got {tuple(embeddings.shape)}")
+        if embeddings.size(0) != self.num_classes:
+            raise ValueError(f"Expected {self.num_classes} semantic embeddings, got {embeddings.size(0)}")
+        if embeddings.size(1) != self.semantic_dim:
+            raise ValueError(f"Expected semantic dim {self.semantic_dim}, got {embeddings.size(1)}")
+        self.label_embeddings.copy_(F.normalize(embeddings, dim=-1).to(self.label_embeddings.device))
+        self.label_embeddings_ready.fill_(1)
+        self._label_embeddings_ready = True
+
+    def _load_from_state_dict(self, *args: Any, **kwargs: Any) -> None:
+        super()._load_from_state_dict(*args, **kwargs)
+        self._label_embeddings_ready = bool(int(self.label_embeddings_ready.detach().cpu().item()))
+
+    def project(self, features: Tensor) -> Tensor:
+        return F.normalize(self.projection(features), dim=-1)
+
+    def score_embeddings(self, features: Tensor, embeddings: Tensor) -> Tensor:
+        embeddings = F.normalize(embeddings.to(device=features.device, dtype=features.dtype), dim=-1)
+        scale = self.logit_scale.exp().clamp(min=1.0, max=100.0).to(dtype=features.dtype)
+        return self.project(features) @ embeddings.T * scale
+
+    def forward(self, features: Tensor) -> Optional[Tensor]:
+        if not self.has_label_embeddings():
+            return None
+        return self.score_embeddings(features, self.label_embeddings)
+
+
 class DeepDanbooruModern(nn.Module):
     def __init__(self, num_classes: int, config: Optional[Union[ModelConfig, argparse.Namespace, Dict[str, Any]]] = None):
         super().__init__()
@@ -651,6 +780,17 @@ class DeepDanbooruModern(nn.Module):
             raise ValueError("backbone_mode must be pool or features")
 
         self.classifier = self._build_classifier()
+        self.semantic_head = (
+            SemanticAlignmentHead(
+                feature_dim=self.config.feature_dim,
+                semantic_dim=self.config.semantic_dim,
+                num_classes=self.num_classes,
+                dropout=self.config.semantic_projection_dropout,
+                logit_scale=self.config.semantic_logit_scale,
+            )
+            if self.config.use_semantic_head
+            else None
+        )
         self.criterion = build_training_criterion(self.config)
         self._init_new_weights()
 
@@ -663,6 +803,16 @@ class DeepDanbooruModern(nn.Module):
             raise ValueError("classifier_dropout must be in [0, 1)")
         if not 0.0 <= self.config.projection_dropout < 1.0:
             raise ValueError("projection_dropout must be in [0, 1)")
+        if not 0.0 <= self.config.semantic_projection_dropout < 1.0:
+            raise ValueError("semantic_projection_dropout must be in [0, 1)")
+        if self.config.semantic_dim <= 0:
+            raise ValueError("semantic_dim must be positive")
+        if self.config.semantic_loss_weight < 0:
+            raise ValueError("semantic_loss_weight must be non-negative")
+        if self.config.semantic_negative_weight < 0:
+            raise ValueError("semantic_negative_weight must be non-negative")
+        if self.config.semantic_embedding_backend not in {"auto", "transformers", "hash"}:
+            raise ValueError("semantic_embedding_backend must be auto, transformers, or hash")
         if self.config.backbone_mode == "pool" and self.config.fusion_type == "none":
             return
 
@@ -696,6 +846,21 @@ class DeepDanbooruModern(nn.Module):
         if isinstance(self.fusion, nn.Module):
             self.fusion.apply(init_layer)
         self.classifier.apply(init_layer)
+        if self.semantic_head is not None:
+            self.semantic_head.apply(init_layer)
+
+    def has_semantic_head(self) -> bool:
+        return self.semantic_head is not None and self.semantic_head.has_label_embeddings()
+
+    def set_semantic_label_embeddings(self, embeddings: Tensor) -> None:
+        if self.semantic_head is None:
+            raise RuntimeError("Semantic head is disabled in this model config")
+        self.semantic_head.set_label_embeddings(embeddings)
+
+    def score_semantic_candidates(self, features: Tensor, candidate_embeddings: Tensor) -> Tensor:
+        if self.semantic_head is None:
+            raise RuntimeError("Semantic head is disabled in this model config")
+        return self.semantic_head.score_embeddings(features, candidate_embeddings)
 
     def extract_features(self, x: Tensor) -> Tensor:
         if self.config.backbone_mode == "pool":
@@ -703,16 +868,34 @@ class DeepDanbooruModern(nn.Module):
         features = self.backbone(x)
         return self.fusion(features)
 
-    def forward(self, x: Tensor, targets: Optional[Tensor] = None) -> Dict[str, Tensor]:
+    def forward(self, x: Tensor, targets: Optional[Tensor] = None, return_semantic: bool = True) -> Dict[str, Tensor]:
         features = self.extract_features(x)
         logits = self.classifier(features)
         probabilities = torch.sigmoid(logits)
         output = {"logits": logits, "probabilities": probabilities, "features": features}
+        semantic_logits: Optional[Tensor] = None
+        if return_semantic and self.semantic_head is not None:
+            semantic_logits = self.semantic_head(features)
+            if semantic_logits is not None:
+                output["semantic_logits"] = semantic_logits
+                output["semantic_probabilities"] = torch.sigmoid(semantic_logits)
         if targets is not None:
             targets = targets.to(device=logits.device, dtype=logits.dtype)
             if targets.shape != logits.shape:
                 raise ValueError(f"targets must have shape {tuple(logits.shape)}, got {tuple(targets.shape)}")
-            output["loss"] = self.criterion(logits, targets)
+            closed_loss = self.criterion(logits, targets)
+            output["closed_loss"] = closed_loss
+            loss = closed_loss
+            if semantic_logits is not None and self.config.semantic_loss_weight > 0:
+                semantic_loss_raw = F.binary_cross_entropy_with_logits(semantic_logits, targets, reduction="none")
+                if self.config.semantic_negative_weight != 1.0:
+                    semantic_weight = targets + (1.0 - targets) * float(self.config.semantic_negative_weight)
+                    semantic_loss = (semantic_loss_raw * semantic_weight).sum() / semantic_weight.sum().clamp_min(1.0)
+                else:
+                    semantic_loss = semantic_loss_raw.mean()
+                output["semantic_loss"] = semantic_loss
+                loss = loss + float(self.config.semantic_loss_weight) * semantic_loss
+            output["loss"] = loss
         return output
 
     def predict(self, x: Tensor, threshold: float = 0.5, return_probs: bool = False) -> Union[Tensor, Tuple[Tensor, Tensor]]:
@@ -1041,6 +1224,7 @@ class DanbooruTagDataset(Dataset):
         strict_images: bool = True,
         resize_mode: str = "crop",
         augmentation_policy: str = "randaugment",
+        ontology: Optional[Any] = None,
     ):
         if Image is None:
             raise ImportError("Pillow is required. Install it with: pip install pillow")
@@ -1050,6 +1234,7 @@ class DanbooruTagDataset(Dataset):
         self.is_train = bool(is_train)
         self.resize_mode = resize_mode
         self.augmentation_policy = augmentation_policy
+        self.ontology = ontology
         if tags_path is not None:
             self.tags = load_tags(tags_path)
         elif tags is not None:
@@ -1114,6 +1299,8 @@ class DanbooruTagDataset(Dataset):
             label = str(label).strip()
             if not label:
                 continue
+            if self.ontology is not None:
+                label = str(self.ontology.canonical(label))
             idx = self.tag_to_idx.get(label)
             if idx is None:
                 unknown.append(label)
@@ -1516,6 +1703,8 @@ def save_training_checkpoint(
     metrics: Optional[Dict[str, Any]] = None,
     thresholds: Optional[Tensor] = None,
     ema: Optional[ModelEma] = None,
+    semantic_metadata: Optional[Dict[str, Any]] = None,
+    ontology: Optional["SemanticTagOntology"] = None,
 ) -> None:
     base = unwrap_model(model)
     filepath = Path(filepath)
@@ -1533,6 +1722,10 @@ def save_training_checkpoint(
         "augmentation_policy": augmentation_policy,
         "metrics": metrics or {},
     }
+    if semantic_metadata is not None:
+        checkpoint["semantic_metadata"] = semantic_metadata
+    if ontology is not None:
+        checkpoint["ontology"] = ontology.to_dict()
     if thresholds is not None:
         checkpoint["thresholds"] = thresholds.detach().cpu().tolist()
     if optimizer is not None:
@@ -1552,11 +1745,18 @@ def load_checkpoint_metadata(checkpoint_path: Union[str, Path], device: Union[st
 
 
 def _config_for_checkpoint(checkpoint: Dict[str, Any]) -> ModelConfig:
-    config = _coerce_config(checkpoint.get("model_config", ModelConfig()))
+    raw_model_config = checkpoint.get("model_config", {})
+    config = _coerce_config(raw_model_config or ModelConfig())
+    raw_config_keys = set(raw_model_config.keys()) if isinstance(raw_model_config, dict) else {field.name for field in fields(raw_model_config)} if isinstance(raw_model_config, ModelConfig) else set()
     # Old checkpoints from the previous project had feature-only projection/fusion state dicts and no backbone_mode.
     state = checkpoint.get("model_state_dict", {})
-    if "backbone_mode" not in checkpoint.get("model_config", {}) and any(k.startswith("backbone.projections") for k in state):
+    if "backbone_mode" not in raw_config_keys and any(k.startswith("backbone.projections") for k in state):
         config = replace(config, backbone_mode="features")
+    if "use_semantic_head" not in raw_config_keys and not any(k.startswith("semantic_head.") for k in state):
+        config = replace(config, use_semantic_head=False)
+    semantic_embeddings = state.get("semantic_head.label_embeddings")
+    if isinstance(semantic_embeddings, Tensor):
+        config = replace(config, use_semantic_head=True, semantic_dim=int(semantic_embeddings.shape[1]))
     config = replace(config, pretrained=False)
     if "model_name" in checkpoint:
         config = replace(config, model_name=checkpoint["model_name"])
@@ -1589,8 +1789,63 @@ def train_main(args: argparse.Namespace) -> int:
     if args.channels_last and device.type == "cuda":
         logger.info("Using channels_last memory format")
 
-    tags = load_tags(args.tags_path) if args.tags_path else build_tags_from_annotations(args.train_annotations)
+    resume_checkpoint: Optional[Dict[str, Any]] = load_checkpoint_metadata(args.resume, device) if args.resume else None
+    if resume_checkpoint is not None and not args.tags_path and resume_checkpoint.get("tags"):
+        raw_tags = [str(tag) for tag in resume_checkpoint["tags"]]
+        logger.info("Using %d tags from resume checkpoint", len(raw_tags))
+    else:
+        raw_tags = load_tags(args.tags_path) if args.tags_path else build_tags_from_annotations(args.train_annotations)
+    ontology: Optional[SemanticTagOntology] = None
+    if args.ontology_path:
+        ontology = SemanticTagOntology.load(args.ontology_path)
+    elif resume_checkpoint is not None and isinstance(resume_checkpoint.get("ontology"), dict):
+        ontology = SemanticTagOntology.from_dict(resume_checkpoint["ontology"])
+        logger.info("Loaded resume ontology from checkpoint")
+    elif resume_checkpoint is not None:
+        resume_ontology_paths = []
+        if args.resume:
+            resume_ontology_paths.append(Path(args.resume).parent / "ontology.json")
+        resume_ontology_paths.append(output_dir / "ontology.json")
+        for candidate_ontology_path in resume_ontology_paths:
+            if candidate_ontology_path.exists():
+                ontology = SemanticTagOntology.load(candidate_ontology_path)
+                logger.info("Loaded resume ontology from %s", candidate_ontology_path)
+                break
+    elif args.alias_path or (args.canonicalize_training_tags and resume_checkpoint is None):
+        ontology = SemanticTagOntology.build(
+            raw_tags,
+            alias_path=args.alias_path,
+            fuzzy_threshold=args.fuzzy_threshold,
+            strip_parentheses_for_alias=args.strip_parentheses_for_alias,
+        )
+    if resume_checkpoint is not None and args.canonicalize_training_tags and ontology is None:
+        logger.warning("Resume ontology was not found; training labels will be matched only by exact tag text")
+
+    if ontology is not None and args.canonicalize_training_tags:
+        seen_tags: set[str] = set()
+        tags = []
+        for tag in raw_tags:
+            canonical = ontology.canonical(tag)
+            key = normalize_tag_text(canonical)
+            if key and key not in seen_tags:
+                seen_tags.add(key)
+                tags.append(canonical)
+        logger.info("Canonicalized training tags: raw=%d canonical=%d", len(raw_tags), len(tags))
+    else:
+        tags = raw_tags
+    if resume_checkpoint is not None:
+        checkpoint_tags = [str(tag) for tag in resume_checkpoint.get("tags", [])]
+        if checkpoint_tags and tags != checkpoint_tags:
+            raise ValueError(
+                "Resume checkpoint tags do not match the active tag list. "
+                "Resume training must use exactly the same tags/order as the checkpoint."
+            )
+        checkpoint_classes = int(resume_checkpoint.get("num_classes", len(tags)))
+        if checkpoint_classes != len(tags):
+            raise ValueError(f"Resume checkpoint has {checkpoint_classes} classes, but active tag list has {len(tags)}")
     save_tags(tags, output_dir / "tags.txt")
+    if ontology is not None:
+        ontology.save(output_dir / "ontology.json")
     logger.info("Number of tags/classes: %d", len(tags))
 
     train_dataset = DanbooruTagDataset(
@@ -1602,6 +1857,7 @@ def train_main(args: argparse.Namespace) -> int:
         strict_images=not args.allow_missing_images,
         resize_mode=args.resize_mode,
         augmentation_policy=args.augmentation_policy,
+        ontology=ontology if args.canonicalize_training_tags else None,
     )
     val_dataset = (
         DanbooruTagDataset(
@@ -1613,6 +1869,7 @@ def train_main(args: argparse.Namespace) -> int:
             strict_images=not args.allow_missing_images,
             resize_mode=args.val_resize_mode or ("pad" if args.resize_mode == "crop" else args.resize_mode),
             augmentation_policy="none",
+            ontology=ontology if args.canonicalize_training_tags else None,
         )
         if args.val_annotations
         else None
@@ -1626,8 +1883,77 @@ def train_main(args: argparse.Namespace) -> int:
     )
     val_loader = create_dataloader(val_dataset, args.batch_size, shuffle=False, num_workers=args.num_workers) if val_dataset else None
 
-    model_kwargs = model_kwargs_from_args(args)
+    explicit_model_kwargs = model_kwargs_from_args(args)
+    if resume_checkpoint is not None:
+        model_kwargs = _config_to_dict(_config_for_checkpoint(resume_checkpoint))
+        shape_keys = {
+            "model_name",
+            "backbone_mode",
+            "out_indices",
+            "feature_dim",
+            "fusion_type",
+            "attention_module",
+            "pool_type",
+            "use_semantic_head",
+            "semantic_dim",
+        }
+        incompatible = []
+        for key in shape_keys & explicit_model_kwargs.keys():
+            old_value = model_kwargs.get(key)
+            new_value = explicit_model_kwargs[key]
+            if key == "out_indices":
+                old_value = tuple(old_value) if isinstance(old_value, list) else old_value
+                new_value = tuple(new_value) if isinstance(new_value, list) else new_value
+            if old_value != new_value:
+                incompatible.append(f"{key}: checkpoint={old_value!r}, requested={new_value!r}")
+        if incompatible:
+            raise ValueError("Cannot change shape-defining model options when resuming: " + "; ".join(incompatible))
+        model_kwargs.update(explicit_model_kwargs)
+        model_kwargs["pretrained"] = False
+    else:
+        model_kwargs = explicit_model_kwargs
+    semantic_metadata: Optional[Dict[str, Any]] = None
+    semantic_label_embeddings: Optional[Tensor] = None
+    resume_has_semantic_embeddings = False
+    if resume_checkpoint is not None:
+        ready = resume_checkpoint.get("model_state_dict", {}).get("semantic_head.label_embeddings_ready")
+        if isinstance(ready, Tensor):
+            resume_has_semantic_embeddings = bool(int(ready.detach().cpu().item()))
+        elif ready is not None:
+            resume_has_semantic_embeddings = bool(int(ready))
+        semantic_metadata = resume_checkpoint.get("semantic_metadata")
+    if model_kwargs.get("use_semantic_head", ModelConfig().use_semantic_head) and not resume_has_semantic_embeddings:
+        default_semantic_config = ModelConfig()
+        semantic_backend = model_kwargs.get("semantic_embedding_backend") or args.semantic_embedding_backend or default_semantic_config.semantic_embedding_backend
+        semantic_text_model = model_kwargs.get("semantic_text_model") or args.semantic_text_model or default_semantic_config.semantic_text_model
+        semantic_prompt_prefix = model_kwargs.get("semantic_prompt_prefix") or args.semantic_prompt_prefix or default_semantic_config.semantic_prompt_prefix
+        semantic_dim = int(model_kwargs.get("semantic_dim") or args.semantic_dim or default_semantic_config.semantic_dim)
+        semantic_label_embeddings, semantic_metadata = build_semantic_text_embeddings(
+            tags,
+            backend=semantic_backend,
+            model_name=semantic_text_model,
+            dim=semantic_dim,
+            prompt_prefix=semantic_prompt_prefix,
+            batch_size=args.semantic_embedding_batch_size,
+            device=args.semantic_embedding_device or args.device,
+            dtype=args.semantic_embedding_dtype,
+            cache_path=args.semantic_embedding_cache,
+        )
+        model_kwargs["semantic_dim"] = int(semantic_label_embeddings.size(1))
+        model_kwargs["semantic_embedding_backend"] = str(semantic_metadata.get("backend", model_kwargs.get("semantic_embedding_backend", "auto")))
+        model_kwargs["semantic_text_model"] = semantic_text_model
+        model_kwargs["semantic_prompt_prefix"] = semantic_prompt_prefix
+        logger.info(
+            "Semantic label embeddings ready: backend=%s dim=%d tags=%d",
+            semantic_metadata.get("backend"),
+            semantic_label_embeddings.size(1),
+            semantic_label_embeddings.size(0),
+        )
+    elif resume_has_semantic_embeddings:
+        logger.info("Semantic label embeddings will be restored from resume checkpoint")
     model = create_model(num_classes=len(tags), **model_kwargs).to(device)
+    if semantic_label_embeddings is not None:
+        unwrap_model(model).set_semantic_label_embeddings(semantic_label_embeddings)
     if args.channels_last and device.type == "cuda":
         model = model.to(memory_format=torch.channels_last)
 
@@ -1649,8 +1975,8 @@ def train_main(args: argparse.Namespace) -> int:
     start_epoch = 1
     best_metric = -math.inf
     calibrated_thresholds: Optional[Tensor] = None
-    if args.resume:
-        checkpoint = load_checkpoint_metadata(args.resume, device)
+    if resume_checkpoint is not None:
+        checkpoint = resume_checkpoint
         unwrap_model(model).load_state_dict(checkpoint["model_state_dict"])
         if "optimizer_state_dict" in checkpoint:
             optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
@@ -1748,6 +2074,8 @@ def train_main(args: argparse.Namespace) -> int:
             metrics={"train": train_metrics, "valid": val_metrics},
             thresholds=calibrated_thresholds,
             ema=ema,
+            semantic_metadata=semantic_metadata,
+            ontology=ontology,
         )
         if is_best:
             save_training_checkpoint(
@@ -1765,6 +2093,8 @@ def train_main(args: argparse.Namespace) -> int:
                 metrics={"train": train_metrics, "valid": val_metrics},
                 thresholds=calibrated_thresholds,
                 ema=ema,
+                semantic_metadata=semantic_metadata,
+                ontology=ontology,
             )
         if args.save_every > 0 and epoch % args.save_every == 0:
             save_training_checkpoint(
@@ -1782,6 +2112,8 @@ def train_main(args: argparse.Namespace) -> int:
                 metrics={"train": train_metrics, "valid": val_metrics},
                 thresholds=calibrated_thresholds,
                 ema=ema,
+                semantic_metadata=semantic_metadata,
+                ontology=ontology,
             )
     logger.info("Training completed. Best %s: %.4f", args.monitor, best_metric)
     return 0
@@ -1814,9 +2146,9 @@ def load_image_tensor(image_path: Union[str, Path], input_size: int, resize_mode
 
 
 def _probabilities_with_tta(model: nn.Module, images: Tensor, tta: str = "none") -> Tensor:
-    probs = model(images)["probabilities"]
+    probs = model(images, return_semantic=False)["probabilities"]
     if tta in {"hflip", "flip"}:
-        probs = (probs + model(torch.flip(images, dims=[3]))["probabilities"]) * 0.5
+        probs = (probs + model(torch.flip(images, dims=[3]), return_semantic=False)["probabilities"]) * 0.5
     elif tta != "none":
         raise ValueError("tta must be none or hflip")
     return probs
@@ -1935,24 +2267,6 @@ DEFAULT_SEMANTIC_TAG_BANK: Dict[str, List[str]] = {
     ],
 }
 
-
-def normalize_tag_text(tag: str) -> str:
-    tag = str(tag).strip().lower()
-    tag = tag.replace("_", " ").replace("-", " ")
-    tag = re.sub(r"\s+", " ", tag)
-    tag = re.sub(r"[^a-z0-9\s:/().+]+", "", tag)
-    return tag.strip()
-
-
-def tag_to_prompt(tag: str, prefix: str = "anime image with") -> str:
-    text = normalize_tag_text(tag)
-    if not text:
-        return prefix
-    # Keep compact Danbooru phrases, but convert them into natural text for VLM scoring.
-    text = text.replace("1girl", "one girl").replace("1boy", "one boy")
-    return f"{prefix} {text}"
-
-
 def load_tag_list(path: Optional[Union[str, Path]]) -> List[str]:
     if not path:
         return []
@@ -1975,6 +2289,152 @@ def load_tag_list(path: Optional[Union[str, Path]]) -> List[str]:
             return [str(x) for x in data]
         raise ValueError("Unsupported JSON tag list")
     return [line.strip() for line in p.read_text(encoding="utf-8").splitlines() if line.strip() and not line.startswith("#")]
+
+
+def _semantic_embedding_signature(tags: Sequence[str], metadata: Dict[str, Any]) -> str:
+    h = hashlib.sha256()
+    h.update(json.dumps(list(tags), ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+    h.update(json.dumps(metadata, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8"))
+    return h.hexdigest()
+
+
+def _torch_inputs_to_device(inputs: Any, device: torch.device) -> Any:
+    if hasattr(inputs, "to"):
+        return inputs.to(device)
+    if isinstance(inputs, dict):
+        return {key: value.to(device) if hasattr(value, "to") else value for key, value in inputs.items()}
+    return inputs
+
+
+def _first_tensor_attr(obj: Any, names: Sequence[str]) -> Optional[Tensor]:
+    for name in names:
+        value = getattr(obj, name, None)
+        if isinstance(value, Tensor):
+            return value
+    if isinstance(obj, dict):
+        for name in names:
+            value = obj.get(name)
+            if isinstance(value, Tensor):
+                return value
+    return None
+
+
+@torch.inference_mode()
+def encode_tags_with_transformer_text(
+    tags: Sequence[str],
+    model_name: str,
+    prompt_prefix: str,
+    batch_size: int = 64,
+    device: Optional[Union[str, torch.device]] = None,
+    dtype: str = "auto",
+) -> Tensor:
+    if not TRANSFORMERS_AVAILABLE:
+        raise ImportError("transformers is not installed")
+    dev = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
+    if dtype == "fp16" and dev.type == "cuda":
+        torch_dtype = torch.float16
+    elif dtype == "bf16" and dev.type == "cuda":
+        torch_dtype = torch.bfloat16
+    else:
+        torch_dtype = None
+    processor = AutoProcessor.from_pretrained(model_name)
+    kwargs: Dict[str, Any] = {}
+    if torch_dtype is not None:
+        kwargs["torch_dtype"] = torch_dtype
+    model = AutoModel.from_pretrained(model_name, **kwargs).to(dev).eval()
+    prompts = [tag_to_prompt(tag, prompt_prefix) for tag in tags]
+    features: List[Tensor] = []
+    for start in range(0, len(prompts), max(1, int(batch_size))):
+        batch = prompts[start : start + max(1, int(batch_size))]
+        inputs = processor(text=batch, padding=True, truncation=True, return_tensors="pt")
+        inputs = _torch_inputs_to_device(inputs, dev)
+        if hasattr(model, "get_text_features"):
+            out = model.get_text_features(**inputs)
+        else:
+            raw = model(**inputs)
+            out = _first_tensor_attr(raw, ("text_embeds", "pooler_output", "last_hidden_state"))
+            if out is None:
+                raise RuntimeError("Could not obtain text features from transformer model")
+            if out.ndim == 3:
+                out = out[:, 0]
+        features.append(F.normalize(out.float(), dim=-1).cpu())
+    return torch.cat(features, dim=0)
+
+
+def build_semantic_text_embeddings(
+    tags: Sequence[str],
+    backend: str = "auto",
+    model_name: str = "google/siglip-base-patch16-384",
+    dim: int = 512,
+    prompt_prefix: str = "anime image with",
+    batch_size: int = 64,
+    device: Optional[Union[str, torch.device]] = None,
+    dtype: str = "auto",
+    cache_path: Optional[Union[str, Path]] = None,
+) -> Tuple[Tensor, Dict[str, Any]]:
+    backend = (backend or "auto").lower()
+    if backend not in {"auto", "transformers", "hash"}:
+        raise ValueError("semantic embedding backend must be auto, transformers, or hash")
+    if not tags:
+        metadata = {
+            "backend": "hash" if backend == "auto" else backend,
+            "model_name": model_name,
+            "dim": int(dim),
+            "prompt_prefix": prompt_prefix,
+            "dtype": dtype,
+            "cache_hit": False,
+        }
+        return torch.zeros((0, int(dim)), dtype=torch.float32), metadata
+    requested_metadata = {
+        "backend": backend,
+        "model_name": model_name,
+        "dim": int(dim),
+        "prompt_prefix": prompt_prefix,
+        "dtype": dtype,
+    }
+    signature = _semantic_embedding_signature(tags, requested_metadata)
+    if cache_path:
+        cache = Path(cache_path)
+        if cache.exists():
+            payload = _safe_torch_load(cache, "cpu")
+            if payload.get("signature") == signature and "embeddings" in payload:
+                embeddings = payload["embeddings"].float()
+                metadata = dict(payload.get("metadata", {}))
+                metadata["cache_hit"] = True
+                return F.normalize(embeddings, dim=-1), metadata
+
+    metadata = dict(requested_metadata)
+    metadata["cache_hit"] = False
+    errors: List[str] = []
+    embeddings: Optional[Tensor] = None
+    if backend in {"auto", "transformers"}:
+        try:
+            embeddings = encode_tags_with_transformer_text(
+                tags,
+                model_name=model_name,
+                prompt_prefix=prompt_prefix,
+                batch_size=batch_size,
+                device=device,
+                dtype=dtype,
+            )
+            metadata["backend"] = "transformers"
+            metadata["dim"] = int(embeddings.size(1))
+        except Exception as exc:
+            errors.append(str(exc))
+            if backend == "transformers":
+                raise
+            logger.warning("Transformer text embeddings unavailable; falling back to deterministic hash embeddings: %s", exc)
+    if embeddings is None:
+        embeddings = build_hash_text_embeddings(tags, dim=dim, prompt_prefix=prompt_prefix)
+        metadata["backend"] = "hash"
+        metadata["dim"] = int(embeddings.size(1))
+    if errors:
+        metadata["fallback_errors"] = errors
+    if cache_path:
+        cache = Path(cache_path)
+        ensure_dir(cache.parent)
+        torch.save({"signature": signature, "metadata": metadata, "embeddings": embeddings.cpu()}, cache)
+    return F.normalize(embeddings.float(), dim=-1), metadata
 
 
 def builtin_semantic_tags(categories: Optional[Sequence[str]] = None) -> List[str]:
@@ -2014,9 +2474,17 @@ class SemanticTagOntology:
     canonical expression. Manual aliases always win; automatic grouping is deliberately conservative.
     """
 
-    def __init__(self, tag_to_canonical: Optional[Dict[str, str]] = None, metadata: Optional[Dict[str, Any]] = None):
+    def __init__(
+        self,
+        tag_to_canonical: Optional[Dict[str, str]] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        tag_metadata: Optional[Dict[str, Dict[str, Any]]] = None,
+        relations: Optional[Dict[str, Any]] = None,
+    ):
         self.tag_to_canonical = tag_to_canonical or {}
         self.metadata = metadata or {}
+        self.tag_metadata = tag_metadata or {}
+        self.relations = relations or {}
 
     @staticmethod
     def from_alias_file(alias_path: Optional[Union[str, Path]]) -> "SemanticTagOntology":
@@ -2045,6 +2513,10 @@ class SemanticTagOntology:
             mapping[normalize_tag_text(canonical)] = canonical
             for alias in alias_values:
                 mapping[normalize_tag_text(str(alias))] = canonical
+        preferred = data.get("preferred", {})
+        if isinstance(preferred, dict):
+            for alias, canonical in preferred.items():
+                mapping[normalize_tag_text(str(alias))] = str(canonical).strip()
         metadata["manual_aliases"] = True
         metadata["alias_path"] = str(path)
         return SemanticTagOntology(mapping, metadata)
@@ -2058,11 +2530,17 @@ class SemanticTagOntology:
     ) -> "SemanticTagOntology":
         ontology = SemanticTagOntology.from_alias_file(alias_path)
         mapping = dict(ontology.tag_to_canonical)
+        tag_metadata: Dict[str, Dict[str, Any]] = {}
         groups: Dict[str, List[str]] = {}
         for tag in tags:
             norm = normalize_tag_text(tag)
             if not norm:
                 continue
+            tag_metadata[str(tag)] = {
+                "normalized": norm,
+                "canonical": mapping.get(norm, str(tag)),
+                "category": category_for_semantic_tag(str(tag)),
+            }
             base = norm
             if strip_parentheses_for_alias:
                 base = re.sub(r"\s*\([^)]*\)", "", base).strip()
@@ -2072,6 +2550,7 @@ class SemanticTagOntology:
             canonical = sorted(members, key=lambda x: (len(x), x))[0]
             for member in members:
                 mapping.setdefault(normalize_tag_text(member), canonical)
+                tag_metadata.setdefault(member, {})["canonical"] = mapping[normalize_tag_text(member)]
         # Very conservative fuzzy grouping for small character variants only.
         keys = sorted(groups.keys())
         used: set[str] = set()
@@ -2093,7 +2572,8 @@ class SemanticTagOntology:
                 canonical = sorted(members, key=lambda x: (len(x), x))[0]
                 for member in members:
                     mapping.setdefault(normalize_tag_text(member), canonical)
-        return SemanticTagOntology(mapping, {**ontology.metadata, "fuzzy_threshold": fuzzy_threshold})
+                    tag_metadata.setdefault(member, {})["canonical"] = mapping[normalize_tag_text(member)]
+        return SemanticTagOntology(mapping, {**ontology.metadata, "fuzzy_threshold": fuzzy_threshold}, tag_metadata=tag_metadata)
 
     @staticmethod
     def load(path: Optional[Union[str, Path]]) -> "SemanticTagOntology":
@@ -2103,18 +2583,34 @@ class SemanticTagOntology:
         if not p.exists():
             raise FileNotFoundError(f"Ontology not found: {p}")
         data = json.loads(p.read_text(encoding="utf-8"))
+        return SemanticTagOntology.from_dict(data)
+
+    @staticmethod
+    def from_dict(data: Dict[str, Any]) -> "SemanticTagOntology":
+        relations = dict(data.get("relations", {}))
+        if "cooccurrence" in data:
+            relations.setdefault("cooccurrence", data["cooccurrence"])
+        if "semantic_similarity" in data:
+            relations.setdefault("semantic_similarity", data["semantic_similarity"])
         return SemanticTagOntology(
             tag_to_canonical={str(k): str(v) for k, v in data.get("tag_to_canonical", {}).items()},
             metadata=data.get("metadata", {}),
+            tag_metadata=data.get("tag_metadata", {}),
+            relations=relations,
         )
 
     def save(self, path: Union[str, Path]) -> None:
         path = Path(path)
         ensure_dir(path.parent)
-        path.write_text(
-            json.dumps({"tag_to_canonical": self.tag_to_canonical, "metadata": self.metadata}, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
+        path.write_text(json.dumps(self.to_dict(), ensure_ascii=False, indent=2), encoding="utf-8")
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "tag_to_canonical": self.tag_to_canonical,
+            "metadata": self.metadata,
+            "tag_metadata": self.tag_metadata,
+            "relations": self.relations,
+        }
 
     def canonical(self, tag: str) -> str:
         return self.tag_to_canonical.get(normalize_tag_text(tag), str(tag))
@@ -2170,8 +2666,68 @@ def build_cooccurrence_graph(annotation_path: Union[str, Path], tags: Sequence[s
     return {"counts": counts, "neighbors": neighbors, "min_count": min_count, "top_k": top_k}
 
 
+def build_semantic_similarity_graph(
+    tags: Sequence[str],
+    backend: str = "auto",
+    model_name: str = "google/siglip-base-patch16-384",
+    dim: int = 512,
+    prompt_prefix: str = "anime image with",
+    batch_size: int = 64,
+    device: Optional[Union[str, torch.device]] = None,
+    dtype: str = "auto",
+    cache_path: Optional[Union[str, Path]] = None,
+    min_similarity: float = 0.42,
+    top_k: int = 20,
+) -> Dict[str, Any]:
+    if not tags:
+        return {"metadata": {}, "neighbors": {}}
+    embeddings, metadata = build_semantic_text_embeddings(
+        tags,
+        backend=backend,
+        model_name=model_name,
+        dim=dim,
+        prompt_prefix=prompt_prefix,
+        batch_size=batch_size,
+        device=device,
+        dtype=dtype,
+        cache_path=cache_path,
+    )
+    embeddings = F.normalize(embeddings.float().cpu(), dim=-1)
+    similarity = embeddings @ embeddings.T
+    neighbors: Dict[str, List[Dict[str, Any]]] = {}
+    for idx, tag in enumerate(tags):
+        row = similarity[idx].clone()
+        row[idx] = -1.0
+        k = min(max(1, int(top_k)), max(len(tags) - 1, 1))
+        values, indices = torch.topk(row, k=k)
+        items = []
+        for score, other_idx in zip(values.tolist(), indices.tolist()):
+            if float(score) < min_similarity:
+                continue
+            other_tag = str(tags[int(other_idx)])
+            items.append(
+                {
+                    "tag": other_tag,
+                    "similarity": float(score),
+                    "canonical": normalize_tag_text(tag) == normalize_tag_text(other_tag),
+                }
+            )
+        neighbors[str(tag)] = items
+    return {
+        "metadata": metadata,
+        "neighbors": neighbors,
+        "min_similarity": float(min_similarity),
+        "top_k": int(top_k),
+    }
+
+
 def build_ontology_main(args: argparse.Namespace) -> int:
-    tags = load_tags(args.tags_path) if args.tags_path else build_tags_from_annotations(args.annotations)
+    if args.tags_path:
+        tags = load_tags(args.tags_path)
+    elif args.annotations:
+        tags = build_tags_from_annotations(args.annotations)
+    else:
+        tags = []
     if args.extra_candidate_tags:
         tags = list(tags) + load_tag_list(args.extra_candidate_tags)
     if args.include_builtin_semantics:
@@ -2185,9 +2741,32 @@ def build_ontology_main(args: argparse.Namespace) -> int:
         fuzzy_threshold=args.fuzzy_threshold,
         strip_parentheses_for_alias=args.strip_parentheses_for_alias,
     )
-    payload = {"tag_to_canonical": ontology.tag_to_canonical, "metadata": ontology.metadata, "tags": tags}
+    relations: Dict[str, Any] = dict(ontology.relations)
+    payload = {
+        "tag_to_canonical": ontology.tag_to_canonical,
+        "metadata": ontology.metadata,
+        "tag_metadata": ontology.tag_metadata,
+        "relations": relations,
+        "tags": tags,
+    }
     if args.annotations:
         payload["cooccurrence"] = build_cooccurrence_graph(args.annotations, tags, min_count=args.min_cooccurrence, top_k=args.cooccurrence_top_k)
+        relations["cooccurrence"] = payload["cooccurrence"]
+    if args.semantic_similarity_graph:
+        payload["semantic_similarity"] = build_semantic_similarity_graph(
+            tags,
+            backend=args.semantic_embedding_backend,
+            model_name=args.semantic_text_model,
+            dim=args.semantic_dim,
+            prompt_prefix=args.semantic_prompt_prefix,
+            batch_size=args.semantic_embedding_batch_size,
+            device=args.semantic_embedding_device or args.device,
+            dtype=args.semantic_embedding_dtype,
+            cache_path=args.semantic_embedding_cache,
+            min_similarity=args.semantic_min_similarity,
+            top_k=args.semantic_top_k,
+        )
+        relations["semantic_similarity"] = payload["semantic_similarity"]
     output = Path(args.output)
     ensure_dir(output.parent)
     output.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -2202,7 +2781,7 @@ def make_local_crops(image: Any, mode: str = "grid", max_crops: int = 10) -> Lis
     w, h = image.size
     crops: List[Tuple[str, Any]] = [("global", image)]
     if mode == "none" or max_crops <= 1:
-        return crops[:max_crops]
+        return crops[: max(1, max_crops)]
     # Center crop preserves central subjects.
     side = int(min(w, h) * 0.72)
     if side > 8:
@@ -2289,9 +2868,11 @@ class OpenVocabularyTagger:
                 out = self.model.get_text_features(**inputs)
             else:
                 raw = self.model(**inputs)
-                out = getattr(raw, "text_embeds", None) or getattr(raw, "pooler_output", None)
+                out = _first_tensor_attr(raw, ("text_embeds", "pooler_output", "last_hidden_state"))
                 if out is None:
                     raise RuntimeError("Could not obtain text features from model output")
+                if out.ndim == 3:
+                    out = out[:, 0]
             out = F.normalize(out.float(), dim=-1)
             features.append(out.cpu())
         result = torch.cat(features, dim=0)
@@ -2308,9 +2889,11 @@ class OpenVocabularyTagger:
                 out = self.model.get_image_features(**inputs)
             else:
                 raw = self.model(**inputs)
-                out = getattr(raw, "image_embeds", None) or getattr(raw, "pooler_output", None)
+                out = _first_tensor_attr(raw, ("image_embeds", "pooler_output", "last_hidden_state"))
                 if out is None:
                     raise RuntimeError("Could not obtain image features from model output")
+                if out.ndim == 3:
+                    out = out[:, 0]
             out = F.normalize(out.float(), dim=-1)
             features.append(out.cpu())
         return torch.cat(features, dim=0)
@@ -2407,43 +2990,72 @@ def prepare_open_vocab_candidates(
 def fuse_closed_and_open_predictions(
     closed_items: Sequence[Dict[str, Any]],
     open_items: Sequence[Dict[str, Any]],
+    semantic_items: Optional[Sequence[Dict[str, Any]]] = None,
     ontology: Optional[SemanticTagOntology] = None,
     closed_weight: float = 0.62,
+    semantic_weight: float = 0.45,
     open_weight: float = 0.38,
     min_score: float = 0.25,
     top_k: int = 50,
 ) -> List[Dict[str, Any]]:
     combined: Dict[str, Dict[str, Any]] = {}
-    for item in closed_items:
+
+    def update(item: Dict[str, Any], score_key: str, source_name: str, raw_score_keys: Sequence[str]) -> None:
         tag = str(item.get("tag", ""))
         if not tag:
-            continue
+            return
         canonical = ontology.canonical(tag) if ontology is not None else tag
-        score = float(item.get("probability", item.get("score", 0.0)))
-        entry = combined.setdefault(canonical, {"tag": canonical, "score": 0.0, "closed_score": 0.0, "open_vocab_score": 0.0, "sources": [], "original_tags": []})
-        entry["closed_score"] = max(float(entry.get("closed_score", 0.0)), score)
-        entry["score"] = max(float(entry.get("score", 0.0)), closed_weight * score)
-        entry["sources"].append("closed_classifier")
+        score = 0.0
+        for key in raw_score_keys:
+            if key in item:
+                score = float(item[key])
+                break
+        entry = combined.setdefault(
+            canonical,
+            {
+                "tag": canonical,
+                "score": 0.0,
+                "closed_score": 0.0,
+                "trained_semantic_score": 0.0,
+                "open_vocab_score": 0.0,
+                "sources": [],
+                "original_tags": [],
+            },
+        )
+        entry[score_key] = max(float(entry.get(score_key, 0.0)), score)
+        entry["sources"].append(source_name)
         entry["original_tags"].append(tag)
-    for item in open_items:
-        tag = str(item.get("tag", ""))
-        if not tag:
-            continue
-        canonical = ontology.canonical(tag) if ontology is not None else tag
-        score = float(item.get("score", item.get("open_vocab_score", 0.0)))
-        entry = combined.setdefault(canonical, {"tag": canonical, "score": 0.0, "closed_score": 0.0, "open_vocab_score": 0.0, "sources": [], "original_tags": []})
-        entry["open_vocab_score"] = max(float(entry.get("open_vocab_score", 0.0)), score)
-        entry["score"] = max(float(entry.get("score", 0.0)), open_weight * score + closed_weight * float(entry.get("closed_score", 0.0)))
-        entry["sources"].append("open_vocab_vlm")
-        entry["original_tags"].append(tag)
-        if "best_region" in item and ("best_region" not in entry or score >= entry.get("open_vocab_score", 0.0)):
+        if "best_region" in item and score >= float(entry.get("_best_region_score", -1.0)):
             entry["best_region"] = item.get("best_region")
+            entry["_best_region_score"] = score
         if "category" in item:
             entry["category"] = item.get("category")
+
+    for item in closed_items:
+        update(item, "closed_score", "closed_classifier", ("probability", "score"))
+    for item in semantic_items or []:
+        update(item, "trained_semantic_score", "trained_semantic_head", ("trained_semantic_score", "score"))
+    for item in open_items:
+        update(item, "open_vocab_score", "open_vocab_vlm", ("open_vocab_score", "score"))
+
     result: List[Dict[str, Any]] = []
     for item in combined.values():
+        weighted_score = 0.0
+        active_weight = 0.0
+        if float(item.get("closed_score", 0.0)) > 0:
+            weighted_score += closed_weight * float(item.get("closed_score", 0.0))
+            active_weight += closed_weight
+        if float(item.get("trained_semantic_score", 0.0)) > 0:
+            weighted_score += semantic_weight * float(item.get("trained_semantic_score", 0.0))
+            active_weight += semantic_weight
+        if float(item.get("open_vocab_score", 0.0)) > 0:
+            weighted_score += open_weight * float(item.get("open_vocab_score", 0.0))
+            active_weight += open_weight
+        item["score"] = weighted_score / max(active_weight, 1e-8)
+        item["evidence_weight"] = active_weight
         item["sources"] = sorted(set(item.get("sources", [])))
         item["original_tags"] = sorted(set(item.get("original_tags", [])))
+        item.pop("_best_region_score", None)
         if float(item.get("score", 0.0)) >= min_score:
             result.append(item)
     result.sort(key=lambda x: float(x.get("score", 0.0)), reverse=True)
@@ -2484,6 +3096,64 @@ def closed_set_predict_for_image(
     return decode_predictions(probs, tags, threshold=threshold, top_k=top_k, thresholds=thresholds)[0]
 
 
+def model_has_ready_semantic_head(model: Optional[nn.Module]) -> bool:
+    if model is None:
+        return False
+    base = unwrap_model(model)
+    return bool(getattr(base, "semantic_head", None) is not None and base.semantic_head.has_label_embeddings())
+
+
+@torch.inference_mode()
+def trained_semantic_predict_for_image(
+    model: Optional[nn.Module],
+    image_path: Path,
+    candidate_tags: Sequence[str],
+    candidate_embeddings: Optional[Tensor],
+    device: torch.device,
+    input_size: int,
+    resize_mode: str,
+    local_mode: str = "grid",
+    max_crops: int = 10,
+    channels_last: bool = False,
+) -> List[Dict[str, Any]]:
+    if model is None or candidate_embeddings is None or not candidate_tags or not model_has_ready_semantic_head(model):
+        return []
+    image = _load_pil_image(image_path)
+    crop_pairs = make_local_crops(image, mode=local_mode, max_crops=max_crops)
+    crop_names = [name for name, _ in crop_pairs]
+    transform = DataAugmentation.get_val_transforms(input_size, resize_mode=resize_mode)
+    images = torch.stack([transform(crop) for _, crop in crop_pairs], dim=0).to(device)
+    if channels_last:
+        images = images.contiguous(memory_format=torch.channels_last)
+    output = model(images, return_semantic=False)
+    features = output["features"]
+    logits = unwrap_model(model).score_semantic_candidates(features, candidate_embeddings)
+    probs = torch.sigmoid(logits.detach().float().cpu())
+    max_probs, best_crop_indices = probs.max(dim=0)
+    global_probs = probs[0]
+    mean_probs = probs.mean(dim=0)
+    items: List[Dict[str, Any]] = []
+    for idx, tag in enumerate(candidate_tags):
+        best_crop = int(best_crop_indices[idx].item())
+        local_score = float(max_probs[idx].item())
+        global_score = float(global_probs[idx].item())
+        score = 0.70 * local_score + 0.20 * global_score + 0.10 * float(mean_probs[idx].item())
+        items.append(
+            {
+                "tag": str(tag),
+                "score": float(score),
+                "trained_semantic_score": float(score),
+                "global_score": global_score,
+                "local_score": local_score,
+                "best_region": crop_names[best_crop],
+                "category": category_for_semantic_tag(str(tag)),
+                "source": "trained_semantic_head",
+            }
+        )
+    items.sort(key=lambda x: float(x["score"]), reverse=True)
+    return items
+
+
 def semantic_infer_main(args: argparse.Namespace) -> int:
     device = get_device(args.device)
     checkpoint: Optional[Dict[str, Any]] = None
@@ -2495,7 +3165,10 @@ def semantic_infer_main(args: argparse.Namespace) -> int:
 
     if args.checkpoint:
         checkpoint = load_checkpoint_metadata(args.checkpoint, device)
-        trained_tags = [str(x) for x in (load_tags(args.tags_path) if args.tags_path else checkpoint.get("tags", []))]
+        checkpoint_tags = [str(x) for x in checkpoint.get("tags", [])]
+        trained_tags = [str(x) for x in (load_tags(args.tags_path) if args.tags_path else checkpoint_tags)]
+        if args.tags_path and checkpoint_tags and trained_tags != checkpoint_tags:
+            raise ValueError("Provided --tags_path does not match checkpoint tags/order")
         if not trained_tags:
             raise ValueError("Checkpoint has no tags. Pass --tags_path.")
         input_size = int(args.input_size or checkpoint.get("input_size", 384))
@@ -2521,20 +3194,85 @@ def semantic_infer_main(args: argparse.Namespace) -> int:
     if not candidates and closed_model is None:
         raise ValueError("No checkpoint and no open-vocabulary candidates. Pass --candidate_tags or enable builtin semantics.")
 
-    ontology = SemanticTagOntology.load(args.ontology_path) if args.ontology_path else SemanticTagOntology.build(candidates + trained_tags, alias_path=args.alias_path, fuzzy_threshold=args.fuzzy_threshold)
+    if args.ontology_path:
+        ontology = SemanticTagOntology.load(args.ontology_path)
+    elif checkpoint is not None and isinstance(checkpoint.get("ontology"), dict):
+        ontology = SemanticTagOntology.from_dict(checkpoint["ontology"])
+    else:
+        ontology = SemanticTagOntology.build(candidates + trained_tags, alias_path=args.alias_path, fuzzy_threshold=args.fuzzy_threshold)
+
+    trained_semantic_embeddings: Optional[Tensor] = None
+    trained_semantic_metadata: Optional[Dict[str, Any]] = None
+    if args.use_trained_semantic and closed_model is not None and candidates and model_has_ready_semantic_head(closed_model):
+        base_model = unwrap_model(closed_model)
+        checkpoint_semantic = checkpoint.get("semantic_metadata", {}) if checkpoint is not None else {}
+        semantic_backend = args.semantic_embedding_backend or checkpoint_semantic.get("backend") or base_model.config.semantic_embedding_backend
+        semantic_text_model = args.semantic_text_model or checkpoint_semantic.get("model_name") or base_model.config.semantic_text_model
+        semantic_prompt_prefix = args.semantic_prompt_prefix or checkpoint_semantic.get("prompt_prefix") or base_model.config.semantic_prompt_prefix
+        try:
+            trained_semantic_embeddings, trained_semantic_metadata = build_semantic_text_embeddings(
+                candidates,
+                backend=semantic_backend,
+                model_name=semantic_text_model,
+                dim=base_model.config.semantic_dim,
+                prompt_prefix=semantic_prompt_prefix,
+                batch_size=args.semantic_embedding_batch_size,
+                device=args.semantic_embedding_device or args.device,
+                dtype=args.semantic_embedding_dtype,
+                cache_path=args.semantic_embedding_cache,
+            )
+            if trained_semantic_embeddings.size(1) != base_model.config.semantic_dim:
+                raise ValueError(
+                    "Candidate semantic embedding dimension does not match the checkpoint semantic head: "
+                    f"{trained_semantic_embeddings.size(1)} != {base_model.config.semantic_dim}. "
+                    "Use the same semantic text model/backend as training, or use --semantic_embedding_backend hash."
+                )
+        except Exception as exc:
+            if args.require_trained_semantic:
+                raise
+            logger.warning("Trained semantic head disabled because candidate text embeddings could not be built: %s", exc)
+            trained_semantic_embeddings = None
+            trained_semantic_metadata = None
+        if trained_semantic_embeddings is not None:
+            logger.info(
+                "Trained semantic head enabled: candidates=%d backend=%s dim=%d",
+                len(candidates),
+                trained_semantic_metadata.get("backend") if trained_semantic_metadata else None,
+                trained_semantic_embeddings.size(1),
+            )
+    elif args.use_trained_semantic and closed_model is not None:
+        logger.info("Trained semantic head unavailable for this checkpoint; continuing without it")
 
     tagger: Optional[OpenVocabularyTagger] = None
-    if candidates:
-        tagger = OpenVocabularyTagger(
-            model_name=args.open_vocab_model,
-            device=device,
-            dtype=args.open_vocab_dtype,
-            prompt_prefix=args.prompt_prefix,
-            batch_size=args.open_vocab_batch_size,
+    if candidates and not args.disable_open_vocab_vlm:
+        try:
+            tagger = OpenVocabularyTagger(
+                model_name=args.open_vocab_model,
+                device=device,
+                dtype=args.open_vocab_dtype,
+                prompt_prefix=args.prompt_prefix,
+                batch_size=args.open_vocab_batch_size,
+            )
+        except Exception as exc:
+            if args.require_open_vocab_vlm:
+                raise
+            logger.warning("Open-vocabulary VLM disabled because it could not be loaded: %s", exc)
+
+    if closed_model is None and trained_semantic_embeddings is None and tagger is None:
+        raise ValueError(
+            "No active inference scorer is available. Pass --checkpoint for the trained model, "
+            "or enable/load the open-vocabulary VLM."
         )
 
     image_paths = collect_image_paths(args.input, recursive=not args.no_recursive)
-    logger.info("Semantic inference images=%d | closed_tags=%d | open_candidates=%d", len(image_paths), len(trained_tags), len(candidates))
+    logger.info(
+        "Semantic inference images=%d | closed_tags=%d | candidates=%d | trained_semantic=%s | vlm=%s",
+        len(image_paths),
+        len(trained_tags),
+        len(candidates),
+        bool(trained_semantic_embeddings is not None),
+        bool(tagger is not None),
+    )
     results: List[Dict[str, Any]] = []
     for idx, image_path in enumerate(image_paths, start=1):
         closed_decoded = closed_set_predict_for_image(
@@ -2550,6 +3288,24 @@ def semantic_infer_main(args: argparse.Namespace) -> int:
             tta=args.tta,
             channels_last=args.channels_last,
         )
+        trained_semantic_items: List[Dict[str, Any]] = []
+        if trained_semantic_embeddings is not None:
+            scored_semantic = trained_semantic_predict_for_image(
+                closed_model,
+                image_path,
+                candidates,
+                trained_semantic_embeddings,
+                device=device,
+                input_size=input_size,
+                resize_mode=resize_mode,
+                local_mode=args.local_crops,
+                max_crops=args.max_crops,
+                channels_last=args.channels_last,
+            )
+            trained_semantic_items = [
+                item for item in scored_semantic if float(item["score"]) >= args.trained_semantic_threshold
+            ][: args.trained_semantic_top_k]
+            trained_semantic_items = ontology.canonicalize_items(trained_semantic_items, score_key="score")
         open_items: List[Dict[str, Any]] = []
         if tagger is not None:
             image = _load_pil_image(image_path)
@@ -2565,23 +3321,27 @@ def semantic_infer_main(args: argparse.Namespace) -> int:
         fused = fuse_closed_and_open_predictions(
             closed_decoded.get("selected", []),
             open_items,
+            semantic_items=trained_semantic_items,
             ontology=ontology,
             closed_weight=args.closed_weight,
+            semantic_weight=args.trained_semantic_weight,
             open_weight=args.open_weight,
             min_score=args.fused_threshold,
             top_k=args.top_k,
         )
-        hidden = summarize_hidden_structure(open_items, per_category=args.hidden_per_category)
+        hidden = summarize_hidden_structure(trained_semantic_items + open_items, per_category=args.hidden_per_category)
         results.append(
             {
                 "image": str(image_path),
                 "fused_tags": fused,
                 "closed_selected": ontology.canonicalize_items(closed_decoded.get("selected", []), score_key="probability"),
                 "closed_top_k": closed_decoded.get("top_k", []),
+                "trained_semantic_selected": trained_semantic_items,
                 "open_vocab_selected": open_items,
                 "hidden_structure": hidden,
                 "metadata": {
                     "checkpoint": str(args.checkpoint) if args.checkpoint else None,
+                    "trained_semantic": trained_semantic_metadata,
                     "open_vocab_model": args.open_vocab_model if tagger is not None else None,
                     "candidate_count": len(candidates),
                     "local_crops": args.local_crops,
@@ -2604,13 +3364,14 @@ def write_semantic_results(results: Sequence[Dict[str, Any]], output_path: Union
     ensure_dir(output_path.parent)
     if output_path.suffix.lower() == ".csv":
         with output_path.open("w", encoding="utf-8-sig", newline="") as f:
-            writer = csv.DictWriter(f, fieldnames=["image", "fused_tags", "open_vocab_tags", "hidden_structure_json", "full_json"])
+            writer = csv.DictWriter(f, fieldnames=["image", "fused_tags", "trained_semantic_tags", "open_vocab_tags", "hidden_structure_json", "full_json"])
             writer.writeheader()
             for item in results:
                 writer.writerow(
                     {
                         "image": item["image"],
                         "fused_tags": " ".join(tag_item["tag"] for tag_item in item.get("fused_tags", [])),
+                        "trained_semantic_tags": " ".join(tag_item["tag"] for tag_item in item.get("trained_semantic_selected", [])),
                         "open_vocab_tags": " ".join(tag_item["tag"] for tag_item in item.get("open_vocab_selected", [])),
                         "hidden_structure_json": json.dumps(item.get("hidden_structure", {}), ensure_ascii=False),
                         "full_json": json.dumps(item, ensure_ascii=False),
@@ -2694,6 +3455,10 @@ def infer_main(args: argparse.Namespace) -> int:
     if not tags:
         raise ValueError("No tags found in checkpoint. Pass --tags_path.")
     tags = [str(tag) for tag in tags]
+    if args.tags_path and checkpoint_tags:
+        checkpoint_tags_list = [str(tag) for tag in checkpoint_tags]
+        if tags != checkpoint_tags_list:
+            raise ValueError("Provided --tags_path does not match checkpoint tags/order")
     input_size = int(args.input_size or checkpoint.get("input_size", 384))
     resize_mode = args.resize_mode or checkpoint.get("resize_mode", "pad")
     if resize_mode == "crop":
@@ -2747,7 +3512,7 @@ def export_onnx_main(args: argparse.Namespace) -> int:
             self.inner = inner
 
         def forward(self, images: Tensor) -> Tensor:
-            return self.inner(images)["probabilities"]
+            return self.inner(images, return_semantic=False)["probabilities"]
 
     wrapper = OnnxWrapper(model).to(device).eval()
     dummy = torch.randn(1, 3, input_size, input_size, device=device)
@@ -2804,9 +3569,9 @@ def test_model_compatibility() -> None:
             with torch.inference_mode():
                 y = model(x)
             assert y["logits"].shape == (1, 10)
-            logger.info("✓ Config works: %s", cfg)
+            logger.info("OK Config works: %s", cfg)
         except Exception as exc:
-            logger.warning("✗ Config failed: %s | %s", cfg, exc)
+            logger.warning("FAIL Config failed: %s | %s", cfg, exc)
 
 
 # -------------------- CLI --------------------
@@ -2829,6 +3594,16 @@ def add_model_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--asl_gamma_pos", type=float, default=None)
     parser.add_argument("--asl_gamma_neg", type=float, default=None)
     parser.add_argument("--asl_clip", type=float, default=None)
+    parser.add_argument("--semantic_head", dest="use_semantic_head", action="store_true", default=None)
+    parser.add_argument("--no_semantic_head", dest="use_semantic_head", action="store_false")
+    parser.add_argument("--semantic_dim", type=int, default=None)
+    parser.add_argument("--semantic_loss_weight", type=float, default=None)
+    parser.add_argument("--semantic_negative_weight", type=float, default=None)
+    parser.add_argument("--semantic_projection_dropout", type=float, default=None)
+    parser.add_argument("--semantic_logit_scale", type=float, default=None)
+    parser.add_argument("--semantic_embedding_backend", type=str, default=None, choices=["auto", "transformers", "hash"])
+    parser.add_argument("--semantic_text_model", type=str, default=None)
+    parser.add_argument("--semantic_prompt_prefix", type=str, default=None)
 
 
 def model_kwargs_from_args(args: argparse.Namespace) -> Dict[str, Any]:
@@ -2858,6 +3633,16 @@ def build_parser() -> argparse.ArgumentParser:
     train_parser.add_argument("--image_dir", default=None)
     train_parser.add_argument("--val_image_dir", default=None)
     train_parser.add_argument("--tags_path", default=None)
+    train_parser.add_argument("--ontology_path", default=None)
+    train_parser.add_argument("--alias_path", default=None, help="Manual alias JSON: {canonical: [aliases]}")
+    train_parser.add_argument("--canonicalize_training_tags", action="store_true", default=True)
+    train_parser.add_argument("--no_canonicalize_training_tags", dest="canonicalize_training_tags", action="store_false")
+    train_parser.add_argument("--fuzzy_threshold", type=float, default=0.97)
+    train_parser.add_argument("--strip_parentheses_for_alias", action="store_true")
+    train_parser.add_argument("--semantic_embedding_cache", default=None)
+    train_parser.add_argument("--semantic_embedding_batch_size", type=int, default=64)
+    train_parser.add_argument("--semantic_embedding_device", default=None)
+    train_parser.add_argument("--semantic_embedding_dtype", default="auto", choices=["auto", "fp16", "bf16"])
     train_parser.add_argument("--output_dir", default="runs/danbooru_modern")
     train_parser.add_argument("--epochs", type=int, default=20)
     train_parser.add_argument("--batch_size", type=int, default=16)
@@ -2926,6 +3711,18 @@ def build_parser() -> argparse.ArgumentParser:
     ontology_parser.add_argument("--semantic_categories", default=None, help="Comma-separated built-in categories")
     ontology_parser.add_argument("--min_cooccurrence", type=int, default=3)
     ontology_parser.add_argument("--cooccurrence_top_k", type=int, default=20)
+    ontology_parser.add_argument("--semantic_similarity_graph", action="store_true")
+    ontology_parser.add_argument("--semantic_embedding_backend", default="auto", choices=["auto", "transformers", "hash"])
+    ontology_parser.add_argument("--semantic_text_model", default="google/siglip-base-patch16-384")
+    ontology_parser.add_argument("--semantic_prompt_prefix", default="anime image with")
+    ontology_parser.add_argument("--semantic_dim", type=int, default=512)
+    ontology_parser.add_argument("--semantic_embedding_cache", default=None)
+    ontology_parser.add_argument("--semantic_embedding_batch_size", type=int, default=64)
+    ontology_parser.add_argument("--semantic_embedding_device", default=None)
+    ontology_parser.add_argument("--semantic_embedding_dtype", default="auto", choices=["auto", "fp16", "bf16"])
+    ontology_parser.add_argument("--semantic_min_similarity", type=float, default=0.42)
+    ontology_parser.add_argument("--semantic_top_k", type=int, default=20)
+    ontology_parser.add_argument("--device", default=None)
     ontology_parser.set_defaults(func=build_ontology_main)
 
     semantic_parser = subparsers.add_parser("semantic_infer", help="Hybrid closed-set + open-vocabulary semantic inference")
@@ -2939,7 +3736,22 @@ def build_parser() -> argparse.ArgumentParser:
     semantic_parser.add_argument("--open_vocab_model", default="google/siglip-base-patch16-384")
     semantic_parser.add_argument("--open_vocab_dtype", default="auto", choices=["auto", "fp16", "bf16"])
     semantic_parser.add_argument("--open_vocab_batch_size", type=int, default=64)
+    semantic_parser.add_argument("--disable_open_vocab_vlm", action="store_true")
+    semantic_parser.add_argument("--require_open_vocab_vlm", action="store_true")
     semantic_parser.add_argument("--prompt_prefix", default="anime image with")
+    semantic_parser.add_argument("--no_trained_semantic", dest="use_trained_semantic", action="store_false")
+    semantic_parser.add_argument("--use_trained_semantic", dest="use_trained_semantic", action="store_true", default=True)
+    semantic_parser.add_argument("--require_trained_semantic", action="store_true")
+    semantic_parser.add_argument("--trained_semantic_threshold", type=float, default=0.28)
+    semantic_parser.add_argument("--trained_semantic_top_k", type=int, default=80)
+    semantic_parser.add_argument("--trained_semantic_weight", type=float, default=0.45)
+    semantic_parser.add_argument("--semantic_embedding_backend", default=None, choices=["auto", "transformers", "hash"])
+    semantic_parser.add_argument("--semantic_text_model", default=None)
+    semantic_parser.add_argument("--semantic_prompt_prefix", default=None)
+    semantic_parser.add_argument("--semantic_embedding_cache", default=None)
+    semantic_parser.add_argument("--semantic_embedding_batch_size", type=int, default=64)
+    semantic_parser.add_argument("--semantic_embedding_device", default=None)
+    semantic_parser.add_argument("--semantic_embedding_dtype", default="auto", choices=["auto", "fp16", "bf16"])
     semantic_parser.add_argument("--include_builtin_semantics", action="store_true", default=True)
     semantic_parser.add_argument("--no_builtin_semantics", dest="include_builtin_semantics", action="store_false")
     semantic_parser.add_argument("--semantic_categories", default=None, help="color,clothing,body_and_character,action,composition,style")
